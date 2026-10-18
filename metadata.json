@@ -1,0 +1,6 @@
+{
+  "name": "B11 Football Trivia - فوازير وتحدي كورة",
+  "description": "برنامج وتحدي فوازير كرة القدم وتحدي تخمين اللاعبين من عيونهم وملامحهم الحقيقية مع مؤثرات ضوئية وصوتية حماسية",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
