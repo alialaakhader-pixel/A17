@@ -40,6 +40,8 @@ jobs:
         run: npm run build
         env:
           VITE_BASE: /${{ github.event.repository.name }}/
+          # Game server (API + WebSocket) hosted on Railway.
+          VITE_API_BASE: https://server-production-c6b4a.up.railway.app
 
       - uses: actions/upload-pages-artifact@v3
         with:
