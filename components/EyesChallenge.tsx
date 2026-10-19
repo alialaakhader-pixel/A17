@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import confetti from 'canvas-confetti';
-import { FootballPlayer } from '../data/playersData';
-import { getAllPlayers } from '../services/storage';
+import { FootballPlayer, FootballLeague } from '../data/playersData';
+import { getAllPlayers, subscribeToDataChanges } from '../services/storage';
 import { PlayerEyeViewer } from './PlayerEyeViewer';
 import { CountdownTimer } from './CountdownTimer';
 import { sound } from '../services/soundEffects';
@@ -36,7 +36,21 @@ export const EyesChallenge: React.FC<EyesChallengeProps> = ({
   onToggleSound,
   initialPlayerId,
 }) => {
-  const [playersList] = useState<FootballPlayer[]>(() => getAllPlayers());
+  const [allPlayers, setAllPlayers] = useState<FootballPlayer[]>(() => getAllPlayers());
+  const [selectedLeague, setSelectedLeague] = useState<'all' | FootballLeague>('all');
+
+  // Instant Owner Sync: Listen to new players or photo edits added by owner
+  useEffect(() => {
+    const unsubscribe = subscribeToDataChanges(() => {
+      setAllPlayers(getAllPlayers());
+    });
+    return unsubscribe;
+  }, []);
+
+  const playersList = selectedLeague === 'all'
+    ? allPlayers
+    : allPlayers.filter((p) => p.league === selectedLeague);
+
   const initialIndex = initialPlayerId
     ? Math.max(0, playersList.findIndex((p) => p.id === initialPlayerId))
     : 0;
@@ -62,7 +76,7 @@ export const EyesChallenge: React.FC<EyesChallengeProps> = ({
   });
 
   const timerRef = useRef<NodeJS.Timeout | null>(null);
-  const currentPlayer: FootballPlayer = playersList[currentIndex] || playersList[0];
+  const currentPlayer: FootballPlayer = playersList[currentIndex] || playersList[0] || allPlayers[0];
 
   useEffect(() => {
     setTimeLeft(25);
@@ -231,6 +245,36 @@ export const EyesChallenge: React.FC<EyesChallengeProps> = ({
             </div>
           )}
         </div>
+      </div>
+
+      {/* Top 5 Leagues Filter Bar */}
+      <div className="w-full max-w-lg mb-3 flex items-center justify-start sm:justify-center gap-1.5 overflow-x-auto pb-1.5 scrollbar-none text-xs">
+        {[
+          { key: 'all', label: 'الكل', flag: '🌍' },
+          { key: 'premier', label: 'البريميرليج', flag: '🏴󠁧󠁢󠁥󠁮󠁧󠁿' },
+          { key: 'laliga', label: 'الليغا', flag: '🇪🇸' },
+          { key: 'bundesliga', label: 'البوندسليغا', flag: '🇩🇪' },
+          { key: 'seriea', label: 'السيريا آ', flag: '🇮🇹' },
+          { key: 'ligue1', label: 'الدوري الفرنسي', flag: '🇫🇷' },
+          { key: 'legend', label: 'أساطير', flag: '👑' },
+        ].map((item) => (
+          <button
+            key={item.key}
+            onClick={() => {
+              sound.playClick();
+              setSelectedLeague(item.key as any);
+              setCurrentIndex(0);
+            }}
+            className={`px-2.5 py-1 rounded-xl font-bold whitespace-nowrap transition cursor-pointer flex items-center gap-1 shrink-0 text-[11px] ${
+              selectedLeague === item.key
+                ? 'bg-lime-400 text-black shadow-[0_0_15px_rgba(203,251,99,0.4)]'
+                : 'bg-neutral-900/90 text-gray-300 hover:text-white hover:bg-neutral-800 border border-white/10'
+            }`}
+          >
+            <span>{item.flag}</span>
+            <span>{item.label}</span>
+          </button>
+        ))}
       </div>
 
       <div className="w-full max-w-lg mb-3 bg-neutral-900/80 border border-white/10 rounded-2xl p-3 flex flex-col gap-2 shadow-lg backdrop-blur-md">

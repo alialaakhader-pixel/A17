@@ -20,6 +20,10 @@ import {
   Bot,
   Play,
   Sparkles,
+  RefreshCw,
+  Clock,
+  Radio,
+  AlertCircle,
 } from 'lucide-react';
 
 interface OnlineArenaProps {
@@ -34,6 +38,13 @@ interface RemotePlayer {
   name: string;
   score: number;
   isHost: boolean;
+}
+
+interface OpenRoomInfo {
+  id: string;
+  hostName: string;
+  playerCount: number;
+  status: string;
 }
 
 export const OnlineArena: React.FC<OnlineArenaProps> = ({
@@ -52,31 +63,88 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
   const [customRoomInput, setCustomRoomInput] = useState(initialRoomCode || '');
   const [roomPlayers, setRoomPlayers] = useState<RemotePlayer[]>([]);
   const [currentRound, setCurrentRound] = useState(0);
+  const [serverChallengeId, setServerChallengeId] = useState<string>('salah');
   const [buzzedPlayerId, setBuzzedPlayerId] = useState<string | null>(null);
   const [buzzedPlayerName, setBuzzedPlayerName] = useState<string | null>(null);
+  const [buzzerTimeLeft, setBuzzerTimeLeft] = useState<number | null>(null);
   const [roundResult, setRoundResult] = useState<string | null>(null);
   const [activeReaction, setActiveReaction] = useState<{ emoji: string; from: string } | null>(null);
   const [copiedLink, setCopiedLink] = useState(false);
   const [isBotMatch, setIsBotMatch] = useState(false);
+  const [statusNotification, setStatusNotification] = useState<string | null>(null);
+
+  // Matchmaking real-time search indicators
+  const [searchTimer, setSearchTimer] = useState(0);
+  const [onlineCount, setOnlineCount] = useState<number>(1);
+  const [queueCount, setQueueCount] = useState<number>(0);
+  const [openRooms, setOpenRooms] = useState<OpenRoomInfo[]>([]);
+  const [serverChallenge, setServerChallenge] = useState<FootballPlayer | null>(null);
 
   const socketRef = useRef<WebSocket | null>(null);
   const botTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const searchIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const buzzerCountdownRef = useRef<NodeJS.Timeout | null>(null);
+  const matchmakingPollRef = useRef<NodeJS.Timeout | null>(null);
+  const roomPollRef = useRef<NodeJS.Timeout | null>(null);
 
   const playersList = getAllPlayers();
-  const currentChallenge: FootballPlayer = playersList[currentRound % playersList.length];
+  // Authoritative synced challenge
+  const currentChallenge: FootballPlayer =
+    serverChallenge ||
+    playersList.find((p) => p.id === serverChallengeId) ||
+    playersList[currentRound % playersList.length] ||
+    playersList[0];
+
+  const flashNotice = (msg: string) => {
+    setStatusNotification(msg);
+    setTimeout(() => setStatusNotification(null), 4000);
+  };
+
+  const loadOpenRooms = async () => {
+    try {
+      const res = await fetch('/api/open-rooms');
+      if (res.ok) {
+        const data = await res.json();
+        setOpenRooms(data || []);
+      }
+    } catch {
+      // Offline
+    }
+  };
 
   useEffect(() => {
+    loadOpenRooms();
+    const interval = setInterval(loadOpenRooms, 6000);
+
     if (initialRoomCode) {
       handleJoinRoom(initialRoomCode);
     }
 
     return () => {
+      clearInterval(interval);
       if (socketRef.current) {
         socketRef.current.close();
       }
       if (botTimerRef.current) clearTimeout(botTimerRef.current);
+      if (searchIntervalRef.current) clearInterval(searchIntervalRef.current);
+      if (buzzerCountdownRef.current) clearInterval(buzzerCountdownRef.current);
     };
   }, []);
+
+  // Search Timer
+  useEffect(() => {
+    if (mode === 'finding_match') {
+      setSearchTimer(0);
+      searchIntervalRef.current = setInterval(() => {
+        setSearchTimer((s) => s + 1);
+      }, 1000);
+    } else {
+      if (searchIntervalRef.current) clearInterval(searchIntervalRef.current);
+    }
+    return () => {
+      if (searchIntervalRef.current) clearInterval(searchIntervalRef.current);
+    };
+  }, [mode]);
 
   const connectWebSocket = (): Promise<WebSocket> => {
     return new Promise((resolve, reject) => {
@@ -95,6 +163,7 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
       };
 
       ws.onerror = (err) => {
+        console.error('WebSocket connection error:', err);
         reject(err);
       };
 
@@ -106,12 +175,27 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
           console.error('Failed to parse WS msg', e);
         }
       };
+
+      ws.onclose = () => {
+        socketRef.current = null;
+      };
     });
   };
 
   const handleServerMessage = (msg: any) => {
+    if (msg.type === 'server_hello' || msg.type === 'queue_update') {
+      if (typeof msg.onlineCount === 'number') setOnlineCount(msg.onlineCount);
+      if (typeof msg.queueCount === 'number') setQueueCount(msg.queueCount);
+    }
+
     if (msg.type === 'queued') {
       setMode('finding_match');
+      if (typeof msg.queueCount === 'number') setQueueCount(msg.queueCount);
+      if (typeof msg.onlineCount === 'number') setOnlineCount(msg.onlineCount);
+    }
+
+    if (msg.type === 'left_queue') {
+      setMode('lobby');
     }
 
     if (msg.type === 'room_created') {
@@ -123,68 +207,164 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
     if (msg.type === 'room_joined') {
       setRoomId(msg.roomId);
       setRoomPlayers(msg.players);
+      if (msg.currentChallengeId) setServerChallengeId(msg.currentChallengeId);
       if (msg.players.length >= 2) {
         setMode('waiting_room');
       }
     }
 
     if (msg.type === 'match_started') {
+      if (matchmakingPollRef.current) clearInterval(matchmakingPollRef.current);
       setRoomId(msg.roomId);
       setRoomPlayers(msg.players);
       setCurrentRound(msg.currentRound || 0);
+      if (msg.challenge) setServerChallenge(msg.challenge);
+      else if (msg.currentChallengeId) setServerChallengeId(msg.currentChallengeId);
       setBuzzedPlayerId(null);
+      setBuzzerTimeLeft(null);
       setRoundResult(null);
       setMode('playing');
       sound.playWhistle(true);
+      flashNotice('تم العثور على خصم حقيقي! بدأت المباراة ⚡');
     }
 
     if (msg.type === 'player_buzzed') {
       setBuzzedPlayerId(msg.buzzedPlayerId);
       setBuzzedPlayerName(msg.buzzedPlayerName);
       sound.playTick(true);
+
+      // Start visual 12-second countdown bar
+      setBuzzerTimeLeft(msg.timeLimit || 12);
+      if (buzzerCountdownRef.current) clearInterval(buzzerCountdownRef.current);
+      buzzerCountdownRef.current = setInterval(() => {
+        setBuzzerTimeLeft((prev) => {
+          if (!prev || prev <= 1) {
+            clearInterval(buzzerCountdownRef.current!);
+            return 0;
+          }
+          return prev - 1;
+        });
+      }, 1000);
     }
 
     if (msg.type === 'round_result') {
+      if (buzzerCountdownRef.current) clearInterval(buzzerCountdownRef.current);
+      setBuzzerTimeLeft(null);
       setRoomPlayers(msg.players);
+
       if (msg.isCorrect) {
         sound.playCorrect();
         setTimeout(() => sound.playStadiumRoar(), 200);
         confetti({ particleCount: 70, spread: 60 });
         setRoundResult(`إجابة صحيحة! اللاعب هو ${currentChallenge.name}`);
+      } else if (msg.isTimeout) {
+        sound.playWrong();
+        setRoundResult(`انتهى وقت البازر! نقطة مجانية للخصم.`);
       } else {
         sound.playWrong();
-        setRoundResult(`إجابة خاطئة! نقطة مجانية للخصم.`);
+        setRoundResult(`إجابة خاطئة! نقطة مجانية للطرف الآخر.`);
       }
     }
 
     if (msg.type === 'new_round') {
+      if (buzzerCountdownRef.current) clearInterval(buzzerCountdownRef.current);
+      setBuzzerTimeLeft(null);
       setCurrentRound(msg.currentRound);
+      if (msg.challenge) setServerChallenge(msg.challenge);
+      else if (msg.currentChallengeId) setServerChallengeId(msg.currentChallengeId);
       setBuzzedPlayerId(null);
       setRoundResult(null);
       sound.playWhistle(true);
     }
 
     if (msg.type === 'game_over') {
+      if (buzzerCountdownRef.current) clearInterval(buzzerCountdownRef.current);
       setRoomPlayers(msg.players);
       setMode('game_over');
       sound.playFanfare();
       confetti({ particleCount: 150, spread: 100 });
     }
 
+    if (msg.type === 'player_left') {
+      if (buzzerCountdownRef.current) clearInterval(buzzerCountdownRef.current);
+      setBuzzerTimeLeft(null);
+      sound.playWrong();
+      flashNotice(msg.message || 'غادر الخصم المباراة! فزت بالمواجهة 🏆');
+      setRoundResult('غادر المنافس المباراة. تم احتساب الفوز لك! 🏆');
+    }
+
     if (msg.type === 'reaction') {
       setActiveReaction({ emoji: msg.emoji, from: msg.playerId });
       setTimeout(() => setActiveReaction(null), 2500);
     }
+
+    if (msg.type === 'error') {
+      sound.playWrong();
+      flashNotice(msg.message || 'حدث خطأ في الاتصال');
+    }
   };
 
-  // 1. Random Matchmaking
+  // 1. Matchmaking Search for a Real Person
   const handleFindMatch = async () => {
     sound.playClick();
     setIsBotMatch(false);
     localStorage.setItem('b11_my_player_name', playerName);
-    const ws = await connectWebSocket();
-    ws.send(JSON.stringify({ type: 'find_match', playerId, playerName }));
     setMode('finding_match');
+
+    // 1. Connect via WebSocket
+    try {
+      const ws = await connectWebSocket();
+      ws.send(JSON.stringify({ type: 'find_match', playerId, playerName }));
+    } catch {
+      // WS error will be handled by HTTP polling fallback
+    }
+
+    // 2. Start HTTP Matchmaking polling in parallel (ensures real opponents match under any network)
+    if (matchmakingPollRef.current) clearInterval(matchmakingPollRef.current);
+    matchmakingPollRef.current = setInterval(async () => {
+      try {
+        const res = await fetch('/api/matchmaking/find', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ playerId, playerName }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.status === 'matched') {
+            if (matchmakingPollRef.current) clearInterval(matchmakingPollRef.current);
+            setRoomId(data.roomId);
+            setRoomPlayers(data.players || []);
+            setCurrentRound(data.currentRound || 0);
+            if (data.challenge) setServerChallenge(data.challenge);
+            setBuzzedPlayerId(null);
+            setRoundResult(null);
+            setMode('playing');
+            sound.playWhistle(true);
+            flashNotice('تم العثور على خصم حقيقي! بدأت المباراة ⚡');
+          } else if (data.status === 'queued') {
+            if (typeof data.queueCount === 'number') setQueueCount(data.queueCount);
+            if (typeof data.onlineCount === 'number') setOnlineCount(data.onlineCount);
+          }
+        }
+      } catch {
+        // network retry
+      }
+    }, 1200);
+  };
+
+  // Cancel Matchmaking
+  const handleCancelSearch = () => {
+    sound.playClick();
+    if (matchmakingPollRef.current) clearInterval(matchmakingPollRef.current);
+    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+      socketRef.current.send(JSON.stringify({ type: 'leave_queue', playerId }));
+    }
+    fetch('/api/matchmaking/leave', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId }),
+    }).catch(() => {});
+    setMode('lobby');
   };
 
   // 2. Create Private Room for Friend
@@ -192,8 +372,13 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
     sound.playClick();
     setIsBotMatch(false);
     localStorage.setItem('b11_my_player_name', playerName);
-    const ws = await connectWebSocket();
-    ws.send(JSON.stringify({ type: 'create_room', playerId, playerName }));
+
+    try {
+      const ws = await connectWebSocket();
+      ws.send(JSON.stringify({ type: 'create_room', playerId, playerName }));
+    } catch {
+      flashNotice('تعذر الاتصال بالسيرفر لإنشاء الغرفة.');
+    }
   };
 
   // 3. Join Room
@@ -203,11 +388,16 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
     sound.playClick();
     setIsBotMatch(false);
     localStorage.setItem('b11_my_player_name', playerName);
-    const ws = await connectWebSocket();
-    ws.send(JSON.stringify({ type: 'join_room', roomId: code.trim(), playerId, playerName }));
+
+    try {
+      const ws = await connectWebSocket();
+      ws.send(JSON.stringify({ type: 'join_room', roomId: code.trim().toUpperCase(), playerId, playerName }));
+    } catch {
+      flashNotice('تعذر الاتصال بالسيرفر.');
+    }
   };
 
-  // 4. Start Real Match
+  // 4. Start Match from Waiting Room
   const handleStartMatch = () => {
     if (isBotMatch) {
       setMode('playing');
@@ -222,7 +412,7 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
     socketRef.current.send(JSON.stringify({ type: 'start_match', roomId }));
   };
 
-  // 5. Start Test Match (Simulated Opponent Bot)
+  // 5. Simulated Bot Match (Offline or Instant fallback)
   const handleStartTestMatch = () => {
     sound.playWhistle(true);
     setIsBotMatch(true);
@@ -230,33 +420,32 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
     setRoomId(generatedRoom);
     const mockPlayers: RemotePlayer[] = [
       { id: playerId, name: playerName || 'أنت', score: 0, isHost: true },
-      { id: 'bot-opponent', name: 'الكابتن سيف (منافس تجريبي 🤖)', score: 0, isHost: false },
+      { id: 'bot-opponent', name: 'الكابتن سيف (محاكي ذكي 🤖)', score: 0, isHost: false },
     ];
     setRoomPlayers(mockPlayers);
     setCurrentRound(0);
+    setServerChallengeId(playersList[0]?.id || 'salah');
     setBuzzedPlayerId(null);
     setRoundResult(null);
     setMode('playing');
     triggerBotTurn();
   };
 
-  // Bot AI logic for testing
   const triggerBotTurn = () => {
     if (botTimerRef.current) clearTimeout(botTimerRef.current);
 
-    // Bot buzzes after 5 to 10 seconds if user hasn't buzzed
-    const delay = Math.floor(5500 + Math.random() * 4500);
+    // Bot buzzes between 5 and 9 seconds
+    const delay = Math.floor(5500 + Math.random() * 4000);
     botTimerRef.current = setTimeout(() => {
       setBuzzedPlayerId((prev) => {
-        if (prev !== null) return prev; // User already buzzed!
+        if (prev !== null) return prev; // Player buzzed first!
         sound.playTick(true);
-        setBuzzedPlayerName('الكابتن سيف (منافس تجريبي 🤖)');
+        setBuzzedPlayerName('الكابتن سيف (محاكي ذكي 🤖)');
 
-        // Bot answers after 1.8 seconds
         setTimeout(() => {
-          const isCorrect = Math.random() > 0.25; // 75% accuracy
+          const isCorrect = Math.random() > 0.25;
           resolveRound('bot-opponent', isCorrect);
-        }, 1800);
+        }, 2000);
 
         return 'bot-opponent';
       });
@@ -269,7 +458,6 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
         if (p.id === answeringPlayerId) {
           return { ...p, score: isCorrect ? p.score + 100 : p.score };
         } else {
-          // Other player gets 50 if wrong
           return { ...p, score: !isCorrect ? p.score + 50 : p.score };
         }
       });
@@ -282,7 +470,7 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
       setRoundResult(`إجابة صحيحة! اللاعب هو ${currentChallenge.name}`);
     } else {
       sound.playWrong();
-      setRoundResult(`إجابة خاطئة! نقطة للطرف الآخر.`);
+      setRoundResult(`إجابة خاطئة! نقطة مجانية للطرف الآخر.`);
     }
   };
 
@@ -298,8 +486,14 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
       return;
     }
 
-    if (!socketRef.current || !roomId) return;
-    socketRef.current.send(JSON.stringify({ type: 'press_buzzer', roomId, playerId }));
+    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+      socketRef.current.send(JSON.stringify({ type: 'press_buzzer', roomId, playerId }));
+    }
+    fetch('/api/matchmaking/buzz', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId, playerId }),
+    }).catch(() => {});
   };
 
   // Submit Answer
@@ -312,8 +506,14 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
       return;
     }
 
-    if (!socketRef.current || !roomId) return;
-    socketRef.current.send(JSON.stringify({ type: 'submit_answer', roomId, playerId, isCorrect }));
+    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+      socketRef.current.send(JSON.stringify({ type: 'submit_answer', roomId, playerId, isCorrect }));
+    }
+    fetch('/api/matchmaking/answer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId, playerId, isCorrect }),
+    }).catch(() => {});
   };
 
   // Next Round
@@ -326,6 +526,8 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
         confetti({ particleCount: 150, spread: 100 });
       } else {
         setCurrentRound(nextR);
+        setServerChallengeId(playersList[nextR % playersList.length]?.id || 'salah');
+        setServerChallenge(null);
         setBuzzedPlayerId(null);
         setRoundResult(null);
         sound.playWhistle(true);
@@ -334,11 +536,17 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
       return;
     }
 
-    if (!socketRef.current || !roomId) return;
-    socketRef.current.send(JSON.stringify({ type: 'next_round', roomId }));
+    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+      socketRef.current.send(JSON.stringify({ type: 'next_round', roomId }));
+    }
+    fetch('/api/matchmaking/next', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId }),
+    }).catch(() => {});
   };
 
-  // Reactions
+  // Live Reactions
   const sendReaction = (emoji: string) => {
     sound.playClick();
     setActiveReaction({ emoji, from: playerId });
@@ -349,7 +557,6 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
     }
   };
 
-  // Public Share URL (Eliminates 403 Forbidden for friends!)
   const publicFriendUrl = getPublicShareUrl({ room: roomId, mode: 'online' });
 
   const copyRoomLink = async () => {
@@ -374,7 +581,7 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
   };
 
   const whatsappRoomShareUrl = `https://api.whatsapp.com/send?text=${encodeURIComponent(
-    `⚽ أدخل والعب معي الآن في فوازير كورة B11 أونلاين 1 ضد 1!\nرمز الغرفة: ${roomId}\nادخل من هذا الرابط مباشرة بدون تسجيل أو تحميل:\n${publicFriendUrl}`
+    `⚽ أدخل والعب معي الآن في فوازير كورة B11 أونلاين 1 ضد 1!\nرمز الغرفة: ${roomId}\nادخل من هذا الرابط مباشرة:\n${publicFriendUrl}`
   )}`;
 
   const me = roomPlayers.find((p) => p.id === playerId);
@@ -407,6 +614,13 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
         </button>
       </div>
 
+      {statusNotification && (
+        <div className="w-full max-w-md mb-3 px-4 py-2 bg-cyan-950/90 border border-cyan-400 rounded-xl text-center text-xs font-bold text-cyan-200 animate-slideUp flex items-center justify-center gap-2">
+          <Sparkles className="w-4 h-4 text-cyan-400 shrink-0" />
+          <span>{statusNotification}</span>
+        </div>
+      )}
+
       {activeReaction && (
         <div className="fixed top-24 left-1/2 -translate-x-1/2 z-50 text-6xl animate-bounce drop-shadow-[0_0_20px_rgba(255,255,255,0.8)]">
           {activeReaction.emoji}
@@ -415,20 +629,31 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
 
       {/* 1. LOBBY */}
       {mode === 'lobby' && (
-        <div className="w-full max-w-lg bg-neutral-900/90 border border-white/10 rounded-3xl p-6 shadow-2xl backdrop-blur-md flex flex-col items-center">
-          <div className="w-16 h-16 rounded-3xl bg-cyan-500/10 border border-cyan-400/40 flex items-center justify-center text-cyan-400 mb-4 shadow-[0_0_25px_rgba(6,182,212,0.3)]">
+        <div className="w-full max-w-lg bg-neutral-900/95 border border-white/10 rounded-3xl p-5 sm:p-6 shadow-2xl backdrop-blur-md flex flex-col items-center">
+          <div className="w-16 h-16 rounded-3xl bg-cyan-500/10 border border-cyan-400/40 flex items-center justify-center text-cyan-400 mb-3 shadow-[0_0_25px_rgba(6,182,212,0.3)]">
             <Users className="w-8 h-8" />
           </div>
 
           <h3 className="text-xl font-black text-white text-center mb-1">
             سيرفر المواجهات الحية (Online Arena)
           </h3>
-          <p className="text-xs text-gray-300 text-center mb-5">
-            تحدَّ أصدقاءك برابط مباشر أو ابدأ تجربة مواجهة فورية لاختبار مهاراتك!
+          <p className="text-xs text-gray-300 text-center mb-4">
+            تحدَّ أشخاصاً حقيقيين أونلاين أو أرسل رابطاً لصاحبك برمز الغرفة للعب فوراً!
           </p>
 
+          {/* Online Live Status Bar */}
+          <div className="w-full mb-4 px-3 py-2 bg-black/60 border border-cyan-500/20 rounded-xl flex items-center justify-between text-[11px] font-bold">
+            <div className="flex items-center gap-1.5 text-emerald-400">
+              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+              <span>المتصلون الآن: {Math.max(1, onlineCount)} لاعب</span>
+            </div>
+            <div className="text-gray-400">
+              طابور البحث: <span className="text-cyan-300">{queueCount}</span>
+            </div>
+          </div>
+
           <div className="w-full mb-4">
-            <label className="block text-xs font-bold text-gray-300 mb-1">اسمك في المباراة:</label>
+            <label className="block text-xs font-bold text-gray-300 mb-1">اسمك في التحدي:</label>
             <input
               type="text"
               value={playerName}
@@ -437,41 +662,35 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
             />
           </div>
 
-          {/* Test Match Button */}
-          <div className="w-full mb-4 p-3 bg-gradient-to-r from-emerald-950/90 via-neutral-900 to-lime-950/90 border-2 border-lime-400/60 rounded-2xl flex flex-col items-center shadow-lg">
-            <div className="flex items-center gap-1.5 mb-1.5 text-lime-300 text-xs font-black">
-              <Sparkles className="w-4 h-4 text-yellow-300 animate-pulse" />
-              <span>تريد تجربة الأونلاين والبازر الآن فوراً؟</span>
-            </div>
-            <button
-              onClick={handleStartTestMatch}
-              className="w-full py-2.5 px-4 rounded-xl bg-lime-400 hover:bg-lime-300 text-black font-black text-xs sm:text-sm flex items-center justify-center gap-2 cursor-pointer transition shadow-md active:scale-95"
-            >
-              <Bot className="w-4 h-4" />
-              <span>بدء مباراة تجريبية فورية (اختبار التحدي والبازر) ⚡</span>
-            </button>
-          </div>
+          {/* MAIN ACTION: Search for Real Person */}
+          <button
+            onClick={handleFindMatch}
+            className="w-full py-3.5 rounded-2xl bg-gradient-to-r from-emerald-400 via-lime-400 to-cyan-400 hover:brightness-110 text-black font-black text-sm flex items-center justify-center gap-2 shadow-[0_0_30px_rgba(52,211,153,0.4)] active:scale-95 transition cursor-pointer mb-3"
+          >
+            <Globe className="w-5 h-5 text-black" />
+            <span>البحث التلقائي عن شخص حقيقي أونلاين ⚡</span>
+          </button>
 
           {/* Create Room For Friend */}
           <button
             onClick={handleCreateRoom}
-            className="w-full py-3.5 rounded-2xl bg-gradient-to-r from-cyan-500 via-sky-400 to-cyan-500 hover:from-cyan-400 hover:to-sky-300 text-black font-black text-sm flex items-center justify-center gap-2 shadow-[0_0_25px_rgba(6,182,212,0.4)] active:scale-95 transition cursor-pointer mb-3"
+            className="w-full py-3 rounded-2xl bg-neutral-800 hover:bg-neutral-700 border border-cyan-400/50 text-cyan-300 font-black text-xs flex items-center justify-center gap-2 active:scale-95 transition cursor-pointer mb-3"
           >
-            <Share2 className="w-4 h-4" />
-            <span>إنشاء غرفة وإرسال رابط عام لصاحبي ⚡</span>
+            <Share2 className="w-4 h-4 text-cyan-400" />
+            <span>إنشاء غرفة ومشاركة الرابط مع صديقي 📲</span>
           </button>
 
-          {/* Find Random Real Opponent */}
+          {/* Test Match Button */}
           <button
-            onClick={handleFindMatch}
-            className="w-full py-3 rounded-2xl bg-neutral-800 hover:bg-neutral-700 border border-cyan-400/40 text-cyan-300 font-bold text-xs flex items-center justify-center gap-2 cursor-pointer transition mb-4"
+            onClick={handleStartTestMatch}
+            className="w-full py-2.5 rounded-xl bg-neutral-900 hover:bg-neutral-800 border border-white/10 text-gray-300 font-bold text-xs flex items-center justify-center gap-2 cursor-pointer transition mb-4"
           >
-            <Globe className="w-4 h-4" />
-            <span>بحث عشوائي عن شخص حقيقي أونلاين</span>
+            <Bot className="w-4 h-4 text-lime-400" />
+            <span>تجربة فورية ضد لاعب ذكي محاكي (تدريب وبازر) 🤖</span>
           </button>
 
           {/* Join By Code */}
-          <div className="w-full flex gap-2">
+          <div className="w-full flex gap-2 mb-4">
             <input
               type="text"
               placeholder="رمز الغرفة (مثال: B11-1234)"
@@ -481,38 +700,131 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
             />
             <button
               onClick={() => handleJoinRoom()}
-              className="px-4 py-2 rounded-xl bg-neutral-800 hover:bg-neutral-700 text-white font-bold text-xs cursor-pointer border border-white/20 transition"
+              className="px-4 py-2 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-black font-black text-xs cursor-pointer transition"
             >
               انضمام
             </button>
           </div>
+
+          {/* Open Public Rooms Section */}
+          {openRooms.length > 0 && (
+            <div className="w-full mt-2 pt-3 border-t border-white/10">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-bold text-lime-400 flex items-center gap-1">
+                  <Radio className="w-3.5 h-3.5 animate-pulse text-lime-400" />
+                  <span>غرف مفتوحة بانتظار منافس ({openRooms.length}):</span>
+                </span>
+                <button
+                  onClick={loadOpenRooms}
+                  className="text-[10px] text-gray-400 hover:text-white flex items-center gap-1"
+                >
+                  <RefreshCw className="w-3 h-3" />
+                  <span>تحديث</span>
+                </button>
+              </div>
+
+              <div className="space-y-1.5 max-h-36 overflow-y-auto pr-1">
+                {openRooms.map((r) => (
+                  <div
+                    key={r.id}
+                    className="p-2 bg-black/50 border border-white/10 rounded-xl flex items-center justify-between"
+                  >
+                    <div>
+                      <span className="text-xs font-bold text-white block">{r.hostName}</span>
+                      <span className="text-[10px] text-gray-400 font-mono">{r.id}</span>
+                    </div>
+                    <button
+                      onClick={() => handleJoinRoom(r.id)}
+                      className="px-3 py-1 rounded-lg bg-lime-400 hover:bg-lime-300 text-black font-bold text-xs transition"
+                    >
+                      تحدي الآن ⚔️
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
 
       {/* 2. FINDING MATCH */}
       {mode === 'finding_match' && (
-        <div className="w-full max-w-md bg-neutral-900/90 border border-cyan-400/40 rounded-3xl p-8 flex flex-col items-center text-center shadow-2xl">
-          <div className="w-16 h-16 rounded-full border-4 border-cyan-400 border-t-transparent animate-spin mb-4" />
-          <h3 className="text-lg font-black text-white mb-2">جاري البحث عن خصم حقيقي...</h3>
-          <p className="text-xs text-gray-400 mb-6">
-            السيرفر يبحث الآن في غرف الانتظار عن لاعب نشط لبدء التحدي المباشر.
+        <div className="w-full max-w-md bg-neutral-900/95 border border-cyan-400/50 rounded-3xl p-6 sm:p-8 flex flex-col items-center text-center shadow-2xl animate-fadeIn">
+          {/* Radar Animation */}
+          <div className="relative w-24 h-24 mb-5 flex items-center justify-center">
+            <div className="absolute inset-0 rounded-full border border-cyan-400/30 animate-ping opacity-60" />
+            <div className="absolute inset-2 rounded-full border border-cyan-400/50 animate-pulse" />
+            <div className="w-14 h-14 rounded-full bg-gradient-to-tr from-cyan-500 to-emerald-400 flex items-center justify-center text-black font-black shadow-[0_0_25px_rgba(6,182,212,0.6)]">
+              <Globe className="w-7 h-7 text-black animate-spin" />
+            </div>
+          </div>
+
+          <h3 className="text-lg font-black text-white mb-1">جاري البحث عن شخص حقيقي أونلاين...</h3>
+          <div className="flex items-center gap-1.5 text-xs text-cyan-300 font-mono mb-3 bg-cyan-950/70 border border-cyan-500/30 px-3 py-1 rounded-full">
+            <Clock className="w-3.5 h-3.5" />
+            <span>وقت البحث: {searchTimer} ثانية</span>
+          </div>
+
+          <p className="text-xs text-gray-300 mb-4 leading-relaxed">
+            السيرفر يمسح الآن قائمة اللاعبين النشطين في طابور الأونلاين لمطابقتك فوراً في مواجهة 1 ضد 1 حقيقية.
           </p>
+
+          <div className="w-full mb-4 p-3 bg-cyan-950/40 border border-cyan-400/30 rounded-2xl flex flex-col gap-2">
+            <span className="text-[11px] font-bold text-cyan-300">
+              💡 يمكنك أيضاً دعوة صديقك ليدخل في ثوانٍ أثناء البحث:
+            </span>
+            <div className="flex gap-2">
+              <a
+                href={`https://api.whatsapp.com/send?text=${encodeURIComponent(
+                  `⚽ تعال العب معي الآن في فوازير كورة B11 أونلاين 1 ضد 1!\nاضغط هنا وادخل مباشرة:\n${getPublicShareUrl({ mode: 'online' })}`
+                )}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex-1 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-black text-xs flex items-center justify-center gap-1.5 transition"
+              >
+                <MessageCircle className="w-3.5 h-3.5" />
+                <span>دعوة عبر واتساب</span>
+              </a>
+              <button
+                onClick={async () => {
+                  sound.playClick();
+                  try {
+                    await navigator.clipboard.writeText(getPublicShareUrl({ mode: 'online' }));
+                    flashNotice('تم نسخ رابط الأونلاين! أرسله لأي صديق ليدخل فوراً 📲');
+                  } catch {
+                    flashNotice('تم نسخ الرابط!');
+                  }
+                }}
+                className="py-2 px-3 rounded-xl bg-neutral-800 hover:bg-neutral-700 text-cyan-300 border border-cyan-500/30 font-bold text-xs flex items-center gap-1 transition"
+              >
+                <Copy className="w-3.5 h-3.5" />
+                <span>نسخ الرابط</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Dynamic Helper if taking a few seconds */}
+          {searchTimer >= 6 && (
+            <div className="w-full mb-4 p-3 bg-amber-950/50 border border-amber-400/40 rounded-2xl text-xs text-amber-200 animate-slideUp">
+              <p className="font-bold mb-2">
+                هل تنتظر منافساً؟ يمكنك مواصلة البحث، أو بدء مباراة فورية للتدريب:
+              </p>
+              <button
+                onClick={handleStartTestMatch}
+                className="w-full py-2 px-3 rounded-xl bg-lime-400 hover:bg-lime-300 text-black font-black text-xs flex items-center justify-center gap-1.5 transition"
+              >
+                <Bot className="w-4 h-4" />
+                <span>بدء مواجهة فورية (منافس ذكي وبازر مباشر) ⚡</span>
+              </button>
+            </div>
+          )}
 
           <div className="flex gap-2 w-full">
             <button
-              onClick={handleStartTestMatch}
-              className="flex-1 py-2.5 rounded-xl bg-lime-400 text-black text-xs font-black cursor-pointer"
+              onClick={handleCancelSearch}
+              className="w-full py-2.5 rounded-xl bg-neutral-800 hover:bg-neutral-700 text-gray-300 text-xs font-bold cursor-pointer"
             >
-              بدء تجربة اللعب فوراً ⚡
-            </button>
-            <button
-              onClick={() => {
-                if (socketRef.current) socketRef.current.close();
-                setMode('lobby');
-              }}
-              className="px-4 py-2.5 rounded-xl bg-neutral-800 text-gray-300 text-xs font-bold cursor-pointer hover:text-white"
-            >
-              إلغاء
+              إلغاء البحث والعودة
             </button>
           </div>
         </div>
@@ -530,14 +842,11 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
             رمز الغرفة: {roomId}
           </span>
 
-          {/* Public Anti-403 Link Box */}
+          {/* Public Link Box */}
           <div className="w-full bg-black/60 border border-lime-400/40 rounded-2xl p-3 mb-4">
             <div className="flex items-center justify-between mb-1">
               <span className="text-[11px] font-bold text-lime-400">
-                الرابط العام لصاحبك (بدون خطأ 403):
-              </span>
-              <span className="text-[10px] bg-emerald-950 text-emerald-300 px-1.5 py-0.5 rounded border border-emerald-500/30">
-                دخول مباشر ومجاني
+                الرابط المباشر لصاحبك (دخول فوري بدون تسجيل):
               </span>
             </div>
 
@@ -553,7 +862,7 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
                   }`}
                 >
                   {copiedLink ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                  <span>{copiedLink ? 'تم النسخ!' : 'نسخ الرابط'}</span>
+                  <span>{copiedLink ? 'تم النسخ!' : 'نسخ'}</span>
                 </button>
 
                 <a
@@ -574,7 +883,7 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
           <div className="w-full grid grid-cols-2 gap-3 mb-5">
             <div className="p-3 bg-black/40 rounded-xl border border-white/10 text-center">
               <span className="text-[10px] text-gray-400 block mb-1">أنت</span>
-              <span className="text-sm font-bold text-white block">{playerName}</span>
+              <span className="text-sm font-bold text-white block truncate">{playerName}</span>
               <span className="text-[10px] text-emerald-400 font-bold">جاهز في الغرفة ✅</span>
             </div>
 
@@ -582,7 +891,7 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
               <span className="text-[10px] text-gray-400 block mb-1">المنافس</span>
               {opponent ? (
                 <>
-                  <span className="text-sm font-bold text-cyan-300 block">{opponent.name}</span>
+                  <span className="text-sm font-bold text-cyan-300 block truncate">{opponent.name}</span>
                   <span className="text-[10px] text-emerald-400 font-bold">انضم للغرفة ✅</span>
                 </>
               ) : (
@@ -606,7 +915,6 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
               <span>بدء مواجهة الصديق ⚡</span>
             </button>
 
-            {/* Test Bot Option */}
             <button
               onClick={handleStartTestMatch}
               className="w-full py-2.5 rounded-xl bg-neutral-800 hover:bg-neutral-700 border border-white/10 text-gray-300 text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer"
@@ -631,7 +939,9 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
               }`}
             >
               <div>
-                <span className="text-[10px] text-gray-400 block">أنت ({me?.name})</span>
+                <span className="text-[10px] text-gray-400 block truncate max-w-[120px]">
+                  أنت ({me?.name})
+                </span>
                 <span className="text-base font-black text-lime-400 font-mono">
                   {me?.score || 0} نقطة
                 </span>
@@ -656,6 +966,12 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
               </div>
               {buzzedPlayerId === opponent?.id && <span className="text-xl animate-bounce">⚡</span>}
             </div>
+          </div>
+
+          {/* Round Indicator */}
+          <div className="w-full flex items-center justify-between px-2 mb-2 text-xs font-bold text-gray-400">
+            <span>الجولة: {currentRound + 1} من 5</span>
+            <span className="text-cyan-400">من يملك هذه العيون؟</span>
           </div>
 
           <PlayerEyeViewer
@@ -692,11 +1008,25 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
           {/* Answering State */}
           {buzzedPlayerId && !roundResult && (
             <div className="w-full mt-3 flex flex-col items-center">
-              <div className="mb-3 px-4 py-1.5 rounded-full text-xs font-black bg-amber-400 text-black animate-pulse text-center">
+              <div className="mb-2 px-4 py-1.5 rounded-full text-xs font-black bg-amber-400 text-black animate-pulse text-center">
                 {buzzedPlayerId === me?.id
                   ? 'أنت ضغطت البازر أولاً! اختر الإجابة الصحيحة الآن:'
                   : `الخصم (${buzzedPlayerName}) ضغط البازر أولاً ويقوم بالاختيار...`}
               </div>
+
+              {/* Buzzer countdown bar */}
+              {buzzerTimeLeft !== null && (
+                <div className="w-full max-w-xs mb-3 flex items-center gap-2">
+                  <Clock className="w-3.5 h-3.5 text-amber-400" />
+                  <div className="flex-1 h-2 bg-neutral-800 rounded-full overflow-hidden border border-white/10">
+                    <div
+                      className="h-full bg-amber-400 transition-all duration-1000 ease-linear rounded-full"
+                      style={{ width: `${(buzzerTimeLeft / 12) * 100}%` }}
+                    />
+                  </div>
+                  <span className="text-xs font-mono font-bold text-amber-300">{buzzerTimeLeft}s</span>
+                </div>
+              )}
 
               <div className="w-full grid grid-cols-2 gap-2">
                 {currentChallenge.options.map((opt, i) => (
@@ -706,7 +1036,7 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
                     disabled={buzzedPlayerId !== me?.id}
                     className={`p-3 rounded-2xl border-2 font-bold text-xs sm:text-sm text-center transition ${
                       buzzedPlayerId === me?.id
-                        ? 'bg-neutral-900 border-lime-400 hover:bg-neutral-800 cursor-pointer active:scale-95'
+                        ? 'bg-neutral-900 border-lime-400 hover:bg-neutral-800 cursor-pointer active:scale-95 text-white'
                         : 'bg-neutral-950 border-neutral-800 text-gray-500 cursor-not-allowed'
                     }`}
                   >
@@ -739,14 +1069,14 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
 
           <div className="w-full bg-black/60 rounded-2xl p-4 border border-white/10 mb-4 flex items-center justify-around">
             <div>
-              <span className="text-xs text-gray-400 block">{me?.name}</span>
+              <span className="text-xs text-gray-400 block truncate max-w-[120px]">{me?.name}</span>
               <span className="text-2xl font-black text-lime-400 font-mono">
                 {me?.score || 0}
               </span>
             </div>
             <div className="text-lg font-black text-yellow-400">ضد</div>
             <div>
-              <span className="text-xs text-gray-400 block">{opponent?.name || 'الخصم'}</span>
+              <span className="text-xs text-gray-400 block truncate max-w-[120px]">{opponent?.name || 'الخصم'}</span>
               <span className="text-2xl font-black text-cyan-400 font-mono">
                 {opponent?.score || 0}
               </span>
@@ -763,14 +1093,14 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
 
           <div className="flex gap-2 w-full">
             <button
-              onClick={handleStartTestMatch}
-              className="flex-1 py-3 rounded-xl bg-lime-400 hover:bg-lime-300 text-black font-black text-xs cursor-pointer"
+              onClick={handleFindMatch}
+              className="flex-1 py-3 rounded-xl bg-lime-400 hover:bg-lime-300 text-black font-black text-xs cursor-pointer transition"
             >
-              إعادة التجربة ⚡
+              بحث عن مباراة أخرى ⚡
             </button>
             <button
               onClick={() => setMode('lobby')}
-              className="flex-1 py-3 rounded-xl bg-neutral-800 hover:bg-neutral-700 text-gray-300 font-bold text-xs cursor-pointer"
+              className="flex-1 py-3 rounded-xl bg-neutral-800 hover:bg-neutral-700 text-gray-300 font-bold text-xs cursor-pointer transition"
             >
               الردهة الرئيسية
             </button>

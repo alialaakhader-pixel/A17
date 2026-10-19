@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { FootballPlayer } from '../data/playersData';
-import { getAllPlayers } from '../services/storage';
+import { getAllPlayers, subscribeToDataChanges } from '../services/storage';
 import { PlayerEyeViewer } from './PlayerEyeViewer';
 import { sound } from '../services/soundEffects';
 import confetti from 'canvas-confetti';
@@ -23,7 +23,14 @@ export const TwoPlayerBattle: React.FC<TwoPlayerBattleProps> = ({
   soundMuted,
   onToggleSound,
 }) => {
-  const [playersList] = useState<FootballPlayer[]>(() => getAllPlayers());
+  const [playersList, setPlayersList] = useState<FootballPlayer[]>(() => getAllPlayers());
+
+  useEffect(() => {
+    const unsubscribe = subscribeToDataChanges(() => {
+      setPlayersList(getAllPlayers());
+    });
+    return unsubscribe;
+  }, []);
   const [round, setRound] = useState(0);
   const [player1Score, setPlayer1Score] = useState(0);
   const [player2Score, setPlayer2Score] = useState(0);

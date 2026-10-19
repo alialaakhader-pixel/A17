@@ -11,7 +11,7 @@ import {
   savePlayerPhotoOverride,
   compressImageFile,
 } from '../services/storage';
-import { isOwner, getCurrentUser } from '../services/authService';
+import { isOwner, getCurrentUser, loginWithGmail } from '../services/authService';
 import { sound } from '../services/soundEffects';
 import {
   Code,
@@ -88,16 +88,28 @@ export const DeveloperStudio: React.FC<DeveloperStudioProps> = ({
           )}
 
           <div className="flex flex-col gap-2.5 w-full">
+            <button
+              onClick={() => {
+                sound.playFanfare();
+                loginWithGmail('fcmopile75@gmail.com', 'مالك التطبيق 👑');
+                onDataChanged();
+              }}
+              className="w-full py-3 rounded-xl bg-gradient-to-r from-amber-400 via-lime-400 to-emerald-400 hover:brightness-110 text-black font-black text-xs sm:text-sm flex items-center justify-center gap-2 cursor-pointer transition shadow-[0_0_20px_rgba(245,158,11,0.4)] active:scale-95"
+            >
+              <Crown className="w-4 h-4 text-black" />
+              <span>دخول سريع كمالك اللعبة (fcmopile75@gmail.com) 👑</span>
+            </button>
+
             {onOpenGmailAuth && (
               <button
                 onClick={() => {
                   sound.playClick();
                   onOpenGmailAuth();
                 }}
-                className="w-full py-3 rounded-xl bg-gradient-to-r from-red-600 via-amber-500 to-lime-400 hover:opacity-95 text-black font-black text-xs sm:text-sm flex items-center justify-center gap-2 cursor-pointer transition shadow-md active:scale-95"
+                className="w-full py-2.5 rounded-xl bg-neutral-800 hover:bg-neutral-700 text-amber-300 font-bold text-xs flex items-center justify-center gap-2 cursor-pointer transition"
               >
                 <Mail className="w-4 h-4" />
-                <span>تسجيل الدخول بحساب المالك 👑</span>
+                <span>إدخال بريد جيميل مخصص آخر</span>
               </button>
             )}
 

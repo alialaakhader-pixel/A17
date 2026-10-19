@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { TriviaQuestion } from '../data/playersData';
-import { getAllTrivia, deleteTrivia, saveCustomTrivia } from '../services/storage';
+import { getAllTrivia, deleteTrivia, saveCustomTrivia, subscribeToDataChanges } from '../services/storage';
 import { sound } from '../services/soundEffects';
 import { CountdownTimer } from './CountdownTimer';
 import confetti from 'canvas-confetti';
@@ -46,8 +46,29 @@ export const TriviaShow: React.FC<TriviaShowProps> = ({ onBackToHome, onOpenShar
 
   const flashNote = (msg: string) => {
     setNotification(msg);
-    setTimeout(() => setNotification(null), 3000);
+    setTimeout(() => setNotification(null), 4000);
   };
+
+  // Instant Owner Question Sync - Updates immediately when owner adds a question
+  useEffect(() => {
+    const unsubscribe = subscribeToDataChanges(() => {
+      const updated = getAllTrivia();
+      setTriviaList(updated);
+    });
+
+    const handleQuestionAdded = (e: any) => {
+      const q = e.detail;
+      const title = q?.question ? (q.question.length > 30 ? q.question.substring(0, 30) + '...' : q.question) : '';
+      flashNote(`⚽ تمت إضافة سؤال جديد للتو من المالك: "${title}"! نُشر فوراً.`);
+    };
+
+    window.addEventListener('b11_question_added', handleQuestionAdded);
+
+    return () => {
+      unsubscribe();
+      window.removeEventListener('b11_question_added', handleQuestionAdded);
+    };
+  }, []);
 
   useEffect(() => {
     setTimeLeft(20);

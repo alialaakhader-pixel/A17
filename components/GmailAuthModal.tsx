@@ -172,6 +172,23 @@ export const GmailAuthModal: React.FC<GmailAuthModalProps> = ({
           </div>
         ) : (
           <form onSubmit={handleSubmit} className="space-y-4">
+            <div className="p-3 bg-amber-950/40 border border-amber-400/40 rounded-2xl flex flex-col gap-1.5">
+              <span className="text-[11px] font-bold text-amber-300">
+                👑 إذا كنت مالك اللعبة، يمكنك الدخول السريع بنقرة واحدة:
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  setEmailInput('fcmopile75@gmail.com');
+                  setNameInput('مالك التطبيق 👑');
+                }}
+                className="py-1.5 px-3 rounded-xl bg-amber-400/20 hover:bg-amber-400/30 text-amber-300 border border-amber-400/30 text-xs font-bold transition flex items-center justify-between cursor-pointer"
+              >
+                <span>fcmopile75@gmail.com</span>
+                <span className="text-[10px] bg-amber-400 text-black px-1.5 py-0.5 rounded font-black">تعبئة سريعة ⚡</span>
+              </button>
+            </div>
+
             <div>
               <label className="block text-xs font-bold text-gray-300 mb-1">
                 بريد الجيميل (Gmail) *

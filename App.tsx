@@ -11,7 +11,7 @@ import { ShareModal } from './components/ShareModal';
 import { GmailAuthModal } from './components/GmailAuthModal';
 import { getCurrentUser, UserAccount } from './services/authService';
 import { EffectsControlBar } from './components/EffectsControlBar';
-import { getAllPlayers } from './services/storage';
+import { getAllPlayers, subscribeToDataChanges } from './services/storage';
 import { sound } from './services/soundEffects';
 import { getPublicShareUrl } from './services/shareHelper';
 import {
@@ -60,6 +60,15 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState<UserAccount | null>(() => getCurrentUser());
   const [gmailModalOpen, setGmailModalOpen] = useState(false);
   const [requiredOwnerNotice, setRequiredOwnerNotice] = useState(false);
+
+  const [homeLeague, setHomeLeague] = useState<string>('all');
+
+  useEffect(() => {
+    const unsubscribe = subscribeToDataChanges(() => {
+      setRosterKey((k) => k + 1);
+    });
+    return unsubscribe;
+  }, []);
 
   useEffect(() => {
     try {
@@ -164,6 +173,9 @@ export default function App() {
   const activePlayers = getAllPlayers();
 
   const filteredFeaturedPlayers = activePlayers.filter((p) => {
+    if (homeLeague !== 'all' && p.league !== homeLeague) {
+      return false;
+    }
     if (!playerSearchQuery.trim()) return true;
     const q = playerSearchQuery.toLowerCase().trim();
     return (
@@ -594,6 +606,35 @@ export default function App() {
                     </button>
                   )}
                 </div>
+              </div>
+
+              {/* Top 5 Leagues Quick Selector */}
+              <div className="w-full flex items-center justify-start gap-1.5 overflow-x-auto pb-2 mb-3 scrollbar-none text-xs">
+                {[
+                  { key: 'all', label: 'الكل (جميع النجوم)', flag: '🌍' },
+                  { key: 'premier', label: 'البريميرليج', flag: '🏴󠁧󠁢󠁥󠁮󠁧󠁿' },
+                  { key: 'laliga', label: 'الليغا', flag: '🇪🇸' },
+                  { key: 'bundesliga', label: 'البوندسليغا', flag: '🇩🇪' },
+                  { key: 'seriea', label: 'السيريا آ', flag: '🇮🇹' },
+                  { key: 'ligue1', label: 'الدوري الفرنسي', flag: '🇫🇷' },
+                  { key: 'legend', label: 'أساطير', flag: '👑' },
+                ].map((item) => (
+                  <button
+                    key={item.key}
+                    onClick={() => {
+                      sound.playClick();
+                      setHomeLeague(item.key);
+                    }}
+                    className={`px-3 py-1.5 rounded-xl font-bold whitespace-nowrap transition cursor-pointer flex items-center gap-1 shrink-0 text-xs ${
+                      homeLeague === item.key
+                        ? 'bg-lime-400 text-black shadow-[0_0_15px_rgba(203,251,99,0.4)]'
+                        : 'bg-black/50 text-gray-300 hover:text-white hover:bg-neutral-800 border border-white/10'
+                    }`}
+                  >
+                    <span>{item.flag}</span>
+                    <span>{item.label}</span>
+                  </button>
+                ))}
               </div>
 
               <div className="relative mb-4 flex items-center">
