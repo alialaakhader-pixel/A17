@@ -5,6 +5,9 @@ import { defineConfig } from 'vite';
 
 export default defineConfig(() => {
   return {
+    // GitHub Pages serves the site from /<repo-name>/, so the deploy workflow
+    // sets VITE_BASE. Everywhere else (AI Studio, local dev) it stays '/'.
+    base: process.env.VITE_BASE || '/',
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {
