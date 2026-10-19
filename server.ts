@@ -13,6 +13,19 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const server = http.createServer(app);
 
+// CORS must be registered BEFORE the routes below, otherwise the /api responses
+// carry no CORS headers and the statically hosted site (GitHub Pages) cannot
+// call this server from another origin.
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
 app.use(express.json({ limit: '10mb' }));
 
 // Persistence Files
@@ -897,17 +910,6 @@ app.post('/api/leaderboard', (req, res) => {
 // Production or Vite Dev Middlewares - With robust 404 & 403 handling
 async function startServer() {
   app.set('trust proxy', 1);
-
-  // Global CORS and security headers to prevent 403 Forbidden
-  app.use((req, res, next) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', '*');
-    if (req.method === 'OPTIONS') {
-      return res.sendStatus(200);
-    }
-    next();
-  });
 
   if (process.env.NODE_ENV !== 'production') {
     const { createServer } = await import('vite');

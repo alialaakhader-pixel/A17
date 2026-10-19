@@ -4,6 +4,7 @@ import { getAllPlayers } from '../services/storage';
 import { PlayerEyeViewer } from './PlayerEyeViewer';
 import { sound } from '../services/soundEffects';
 import { getPublicShareUrl } from '../services/shareHelper';
+import { apiUrl, getWsUrl } from '../services/apiBase';
 import confetti from 'canvas-confetti';
 import {
   Users,
@@ -102,7 +103,7 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
 
   const loadOpenRooms = async () => {
     try {
-      const res = await fetch('/api/open-rooms');
+      const res = await fetch(apiUrl('/api/open-rooms'));
       if (res.ok) {
         const data = await res.json();
         setOpenRooms(data || []);
@@ -153,9 +154,7 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
         return;
       }
 
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/ws`;
-      const ws = new WebSocket(wsUrl);
+      const ws = new WebSocket(getWsUrl());
 
       ws.onopen = () => {
         socketRef.current = ws;
@@ -323,7 +322,7 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
     if (matchmakingPollRef.current) clearInterval(matchmakingPollRef.current);
     matchmakingPollRef.current = setInterval(async () => {
       try {
-        const res = await fetch('/api/matchmaking/find', {
+        const res = await fetch(apiUrl('/api/matchmaking/find'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ playerId, playerName }),
@@ -359,7 +358,7 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
     if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
       socketRef.current.send(JSON.stringify({ type: 'leave_queue', playerId }));
     }
-    fetch('/api/matchmaking/leave', {
+    fetch(apiUrl('/api/matchmaking/leave'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ playerId }),
@@ -489,7 +488,7 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
     if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
       socketRef.current.send(JSON.stringify({ type: 'press_buzzer', roomId, playerId }));
     }
-    fetch('/api/matchmaking/buzz', {
+    fetch(apiUrl('/api/matchmaking/buzz'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ roomId, playerId }),
@@ -509,7 +508,7 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
     if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
       socketRef.current.send(JSON.stringify({ type: 'submit_answer', roomId, playerId, isCorrect }));
     }
-    fetch('/api/matchmaking/answer', {
+    fetch(apiUrl('/api/matchmaking/answer'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ roomId, playerId, isCorrect }),
@@ -539,7 +538,7 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
     if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
       socketRef.current.send(JSON.stringify({ type: 'next_round', roomId }));
     }
-    fetch('/api/matchmaking/next', {
+    fetch(apiUrl('/api/matchmaking/next'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ roomId }),

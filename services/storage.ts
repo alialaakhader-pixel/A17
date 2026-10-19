@@ -1,6 +1,7 @@
 // Local Storage & Server Persistence Manager for Leaderboard, Custom Players, and Trivia
 import { PLAYERS_LIST, GENERAL_TRIVIA, FootballPlayer, TriviaQuestion } from '../data/playersData';
 import { safeStorage } from './safeStorage';
+import { apiUrl, getWsUrl } from './apiBase';
 
 export interface LeaderboardEntry {
   id: string;
@@ -56,9 +57,9 @@ function notifySubscribers() {
 export async function syncFromServer(): Promise<void> {
   try {
     const [triviaRes, playersRes, lbRes] = await Promise.allSettled([
-      fetch('/api/trivia', { cache: 'no-store' }),
-      fetch('/api/players', { cache: 'no-store' }),
-      fetch('/api/leaderboard', { cache: 'no-store' }),
+      fetch(apiUrl('/api/trivia'), { cache: 'no-store' }),
+      fetch(apiUrl('/api/players'), { cache: 'no-store' }),
+      fetch(apiUrl('/api/leaderboard'), { cache: 'no-store' }),
     ]);
 
     let changed = false;
@@ -104,9 +105,7 @@ export function startRealtimeSync() {
 
   function connectWs() {
     try {
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/ws`;
-      const ws = new WebSocket(wsUrl);
+      const ws = new WebSocket(getWsUrl());
 
       ws.onmessage = (event) => {
         try {
@@ -182,8 +181,8 @@ export function startRealtimeSync() {
   setInterval(async () => {
     try {
       const [tRes, pRes] = await Promise.allSettled([
-        fetch('/api/trivia/version', { cache: 'no-store' }),
-        fetch('/api/players/version', { cache: 'no-store' }),
+        fetch(apiUrl('/api/trivia/version'), { cache: 'no-store' }),
+        fetch(apiUrl('/api/players/version'), { cache: 'no-store' }),
       ]);
 
       let needSync = false;
@@ -249,7 +248,7 @@ export function saveLeaderboardEntry(entry: Omit<LeaderboardEntry, 'id' | 'date'
     safeStorage.setItem(LEADERBOARD_KEY, JSON.stringify(updated));
 
     // Async push to server
-    fetch('/api/leaderboard', {
+    fetch(apiUrl('/api/leaderboard'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(newEntry),
@@ -329,7 +328,7 @@ export function saveCustomPlayer(player: FootballPlayer): FootballPlayer[] {
     safeStorage.setItem(CUSTOM_PLAYERS_KEY, JSON.stringify(updated));
 
     // Instant async push to server (Owner Mode)
-    fetch('/api/players', {
+    fetch(apiUrl('/api/players'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(player),
@@ -349,7 +348,7 @@ export function deleteCustomPlayer(playerId: string): FootballPlayer[] {
     cachedPlayers = updated;
     safeStorage.setItem(CUSTOM_PLAYERS_KEY, JSON.stringify(updated));
 
-    fetch(`/api/players/${playerId}`, { method: 'DELETE' }).catch(() => {});
+    fetch(apiUrl(`/api/players/${playerId}`), { method: 'DELETE' }).catch(() => {});
     notifySubscribers();
     return updated;
   } catch {
@@ -399,7 +398,7 @@ export function saveCustomTrivia(question: TriviaQuestion): TriviaQuestion[] {
     safeStorage.setItem(DELETED_TRIVIA_KEY, JSON.stringify(deleted));
 
     // Instant async push to server (Owner Mode)
-    fetch('/api/trivia', {
+    fetch(apiUrl('/api/trivia'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(question),
@@ -430,7 +429,7 @@ export function deleteTrivia(questionId: string): TriviaQuestion[] {
       safeStorage.setItem(DELETED_TRIVIA_KEY, JSON.stringify(deletedIds));
     }
 
-    fetch(`/api/trivia/${questionId}`, { method: 'DELETE' }).catch(() => {});
+    fetch(apiUrl(`/api/trivia/${questionId}`), { method: 'DELETE' }).catch(() => {});
     notifySubscribers();
     return updated;
   } catch {
