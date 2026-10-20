@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { FootballPlayer } from '../data/playersData';
-import { getAllPlayers } from '../services/storage';
+import { FootballPlayer, TriviaQuestion } from '../data/playersData';
+import { getAllPlayers, getAllTrivia } from '../services/storage';
 import { PlayerEyeViewer } from './PlayerEyeViewer';
 import { sound } from '../services/soundEffects';
 import { getPublicShareUrl } from '../services/shareHelper';
@@ -34,6 +34,9 @@ interface OnlineArenaProps {
   initialRoomCode?: string;
 }
 
+type GameType = 'eyes' | 'trivia';
+type Challenge = FootballPlayer | TriviaQuestion;
+
 interface RemotePlayer {
   id: string;
   name: string;
@@ -46,6 +49,7 @@ interface OpenRoomInfo {
   hostName: string;
   playerCount: number;
   status: string;
+  gameType?: GameType;
 }
 
 export const OnlineArena: React.FC<OnlineArenaProps> = ({
@@ -59,12 +63,15 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
   });
   const [playerId] = useState(() => 'usr-' + Math.random().toString(36).substring(2, 9));
   const [mode, setMode] = useState<'lobby' | 'finding_match' | 'waiting_room' | 'playing' | 'game_over'>('lobby');
+  const [gameType, setGameType] = useState<GameType>(() =>
+    localStorage.getItem('b11_online_game_type') === 'trivia' ? 'trivia' : 'eyes'
+  );
 
   const [roomId, setRoomId] = useState(initialRoomCode || '');
   const [customRoomInput, setCustomRoomInput] = useState(initialRoomCode || '');
   const [roomPlayers, setRoomPlayers] = useState<RemotePlayer[]>([]);
   const [currentRound, setCurrentRound] = useState(0);
-  const [serverChallengeId, setServerChallengeId] = useState<string>('salah');
+  const [totalRounds, setTotalRounds] = useState(5);
   const [buzzedPlayerId, setBuzzedPlayerId] = useState<string | null>(null);
   const [buzzedPlayerName, setBuzzedPlayerName] = useState<string | null>(null);
   const [buzzerTimeLeft, setBuzzerTimeLeft] = useState<number | null>(null);
@@ -79,26 +86,53 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
   const [onlineCount, setOnlineCount] = useState<number>(1);
   const [queueCount, setQueueCount] = useState<number>(0);
   const [openRooms, setOpenRooms] = useState<OpenRoomInfo[]>([]);
-  const [serverChallenge, setServerChallenge] = useState<FootballPlayer | null>(null);
+  // Challenge for the current round, exactly as the server sent it
+  const [serverChallenge, setServerChallenge] = useState<Challenge | null>(null);
 
   const socketRef = useRef<WebSocket | null>(null);
   const botTimerRef = useRef<NodeJS.Timeout | null>(null);
   const searchIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const buzzerCountdownRef = useRef<NodeJS.Timeout | null>(null);
   const matchmakingPollRef = useRef<NodeJS.Timeout | null>(null);
-  const roomPollRef = useRef<NodeJS.Timeout | null>(null);
 
-  const playersList = getAllPlayers();
-  // Authoritative synced challenge
-  const currentChallenge: FootballPlayer =
-    serverChallenge ||
-    playersList.find((p) => p.id === serverChallengeId) ||
-    playersList[currentRound % playersList.length] ||
-    playersList[0];
+  // Refs mirror the latest values for callbacks created once (socket handlers, timers)
+  const modeRef = useRef(mode);
+  const roomIdRef = useRef(roomId);
+  const challengeRef = useRef<Challenge | null>(null);
+  const gameTypeRef = useRef<GameType>(gameType);
+  const lastStatusRef = useRef<string>('');
+  const lastRoundRef = useRef<number>(-1);
+  const roomPollBusyRef = useRef(false);
+  modeRef.current = mode;
+  roomIdRef.current = roomId;
+  gameTypeRef.current = gameType;
+
+  const eyesList = getAllPlayers();
+  const triviaList = getAllTrivia();
+
+  const fallbackChallenge = (): Challenge =>
+    gameType === 'trivia' ? triviaList[currentRound % triviaList.length] : eyesList[currentRound % eyesList.length];
+  const currentChallenge: Challenge = serverChallenge || fallbackChallenge() || eyesList[0];
+  challengeRef.current = currentChallenge;
+
+  const isTrivia = gameType === 'trivia';
+  const asPlayer = (c: Challenge) => c as FootballPlayer;
+  const asTrivia = (c: Challenge) => c as TriviaQuestion;
+  const answerOf = (c: Challenge | null, type: GameType): string => {
+    if (!c) return '';
+    return type === 'trivia' ? asTrivia(c).correctAnswer : asPlayer(c).name;
+  };
+  const optionsOf = (c: Challenge): string[] => (c as any).options || [];
 
   const flashNotice = (msg: string) => {
     setStatusNotification(msg);
     setTimeout(() => setStatusNotification(null), 4000);
+  };
+
+  const chooseGameType = (type: GameType) => {
+    sound.playClick();
+    setGameType(type);
+    localStorage.setItem('b11_online_game_type', type);
   };
 
   const loadOpenRooms = async () => {
@@ -113,9 +147,170 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
     }
   };
 
+  const postJson = async (path: string, body: unknown) => {
+    const res = await fetch(apiUrl(path), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    let data: any = null;
+    try {
+      data = await res.json();
+    } catch {
+      // not json
+    }
+    return { ok: res.ok, data };
+  };
+
+  const stopCountdown = () => {
+    if (buzzerCountdownRef.current) clearInterval(buzzerCountdownRef.current);
+    buzzerCountdownRef.current = null;
+  };
+
+  const startCountdown = (seconds: number) => {
+    stopCountdown();
+    setBuzzerTimeLeft(seconds);
+    buzzerCountdownRef.current = setInterval(() => {
+      setBuzzerTimeLeft((prev) => {
+        if (!prev || prev <= 1) {
+          stopCountdown();
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  };
+
+  // The server is the single source of truth. Every update (socket event, HTTP reply,
+  // or the 1s room poll) funnels through here, so a player whose socket missed an
+  // event (or never had one) still sees the buzz, the result and the next round.
+  const applySnapshot = (snap: any) => {
+    if (!snap || !snap.status) return;
+    const type: GameType = snap.gameType === 'trivia' ? 'trivia' : 'eyes';
+    const prevStatus = lastStatusRef.current;
+    const prevRound = lastRoundRef.current;
+
+    if (snap.roomId) setRoomId(snap.roomId);
+    setGameType(type);
+    setRoomPlayers(snap.players || []);
+    setCurrentRound(snap.currentRound || 0);
+    if (typeof snap.totalRounds === 'number') setTotalRounds(snap.totalRounds);
+    if (snap.challenge) setServerChallenge(snap.challenge);
+
+    if (snap.status === 'waiting') {
+      lastStatusRef.current = 'waiting';
+      if (modeRef.current === 'lobby' || modeRef.current === 'finding_match') setMode('waiting_room');
+      return;
+    }
+
+    if (snap.status === 'game_over') {
+      lastStatusRef.current = 'game_over';
+      if (modeRef.current !== 'game_over') {
+        stopCountdown();
+        setBuzzerTimeLeft(null);
+        setMode('game_over');
+        sound.playFanfare();
+        confetti({ particleCount: 150, spread: 100 });
+      }
+      return;
+    }
+
+    // playing / round_buzzed / round_finished
+    if (modeRef.current !== 'playing') {
+      if (matchmakingPollRef.current) clearInterval(matchmakingPollRef.current);
+      setMode('playing');
+      sound.playWhistle(true);
+      flashNotice('بدأت المباراة! ⚡');
+      attachSocketToRoom(snap.roomId);
+    }
+
+    const newRound = snap.currentRound !== prevRound;
+    if (snap.status === 'playing') {
+      if (newRound || prevStatus !== 'playing') {
+        stopCountdown();
+        setBuzzerTimeLeft(null);
+        setBuzzedPlayerId(null);
+        setBuzzedPlayerName(null);
+        setRoundResult(null);
+        if (prevRound !== -1 && newRound) sound.playWhistle(true);
+      }
+    } else if (snap.status === 'round_buzzed') {
+      setBuzzedPlayerId(snap.buzzedPlayerId);
+      setBuzzedPlayerName(snap.buzzedPlayerName);
+      if (prevStatus !== 'round_buzzed') {
+        sound.playTick(true);
+        startCountdown(12);
+      }
+    } else if (snap.status === 'round_finished') {
+      setBuzzedPlayerId(snap.buzzedPlayerId);
+      setBuzzedPlayerName(snap.buzzedPlayerName);
+      if (prevStatus !== 'round_finished') {
+        stopCountdown();
+        setBuzzerTimeLeft(null);
+        const correct = answerOf(snap.challenge || challengeRef.current, type);
+        const res = snap.lastResult || {};
+        if (res.isCorrect) {
+          sound.playCorrect();
+          setTimeout(() => sound.playStadiumRoar(), 200);
+          confetti({ particleCount: 70, spread: 60 });
+          setRoundResult(`إجابة صحيحة! ${type === 'trivia' ? 'الإجابة' : 'اللاعب هو'}: ${correct}`);
+        } else if (res.isTimeout) {
+          sound.playWrong();
+          setRoundResult(`انتهى وقت البازر! نقطة مجانية للخصم. الإجابة: ${correct}`);
+        } else {
+          sound.playWrong();
+          setRoundResult(`إجابة خاطئة! نقطة مجانية للطرف الآخر. الإجابة الصحيحة: ${correct}`);
+        }
+      }
+    }
+
+    lastStatusRef.current = snap.status;
+    lastRoundRef.current = snap.currentRound;
+  };
+
+  const resetSyncState = () => {
+    lastStatusRef.current = '';
+    lastRoundRef.current = -1;
+    stopCountdown();
+    setBuzzerTimeLeft(null);
+    setBuzzedPlayerId(null);
+    setBuzzedPlayerName(null);
+    setRoundResult(null);
+    setServerChallenge(null);
+  };
+
+  const pollRoom = async () => {
+    const id = roomIdRef.current;
+    if (!id || roomPollBusyRef.current) return;
+    roomPollBusyRef.current = true;
+    try {
+      const res = await fetch(apiUrl(`/api/rooms/${encodeURIComponent(id)}`), { cache: 'no-store' });
+      if (res.ok) {
+        applySnapshot(await res.json());
+      } else if (res.status === 404 && modeRef.current === 'waiting_room') {
+        flashNotice('تم إغلاق الغرفة.');
+        setMode('lobby');
+        setRoomId('');
+      }
+    } catch {
+      // network hiccup: next tick retries
+    } finally {
+      roomPollBusyRef.current = false;
+    }
+  };
+
+  const attachSocketToRoom = (id: string) => {
+    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN && id) {
+      socketRef.current.send(JSON.stringify({ type: 'attach_room', roomId: id, playerId }));
+    }
+  };
+
   useEffect(() => {
     loadOpenRooms();
     const interval = setInterval(loadOpenRooms, 6000);
+    connectWebSocket().catch(() => {
+      // sockets are optional: matchmaking, rooms and the buzzer all work over HTTP
+    });
 
     if (initialRoomCode) {
       handleJoinRoom(initialRoomCode);
@@ -129,8 +324,17 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
       if (botTimerRef.current) clearTimeout(botTimerRef.current);
       if (searchIntervalRef.current) clearInterval(searchIntervalRef.current);
       if (buzzerCountdownRef.current) clearInterval(buzzerCountdownRef.current);
+      if (matchmakingPollRef.current) clearInterval(matchmakingPollRef.current);
     };
   }, []);
+
+  // Keep the room in sync while waiting for a friend or playing
+  useEffect(() => {
+    if (isBotMatch || !roomId || (mode !== 'waiting_room' && mode !== 'playing')) return;
+    pollRoom();
+    const t = setInterval(pollRoom, 1000);
+    return () => clearInterval(t);
+  }, [mode, roomId, isBotMatch]);
 
   // Search Timer
   useEffect(() => {
@@ -176,7 +380,7 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
       };
 
       ws.onclose = () => {
-        socketRef.current = null;
+        if (socketRef.current === ws) socketRef.current = null;
       };
     });
   };
@@ -188,108 +392,22 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
     }
 
     if (msg.type === 'queued') {
-      setMode('finding_match');
       if (typeof msg.queueCount === 'number') setQueueCount(msg.queueCount);
       if (typeof msg.onlineCount === 'number') setOnlineCount(msg.onlineCount);
     }
 
-    if (msg.type === 'left_queue') {
-      setMode('lobby');
-    }
-
-    if (msg.type === 'room_created') {
-      setRoomId(msg.roomId);
-      setRoomPlayers(msg.players);
-      setMode('waiting_room');
-    }
-
-    if (msg.type === 'room_joined') {
-      setRoomId(msg.roomId);
-      setRoomPlayers(msg.players);
-      if (msg.currentChallengeId) setServerChallengeId(msg.currentChallengeId);
-      if (msg.players.length >= 2) {
-        setMode('waiting_room');
-      }
-    }
-
-    if (msg.type === 'match_started') {
-      if (matchmakingPollRef.current) clearInterval(matchmakingPollRef.current);
-      setRoomId(msg.roomId);
-      setRoomPlayers(msg.players);
-      setCurrentRound(msg.currentRound || 0);
-      if (msg.challenge) setServerChallenge(msg.challenge);
-      else if (msg.currentChallengeId) setServerChallengeId(msg.currentChallengeId);
-      setBuzzedPlayerId(null);
-      setBuzzerTimeLeft(null);
-      setRoundResult(null);
-      setMode('playing');
-      sound.playWhistle(true);
-      flashNotice('تم العثور على خصم حقيقي! بدأت المباراة ⚡');
-    }
-
-    if (msg.type === 'player_buzzed') {
-      setBuzzedPlayerId(msg.buzzedPlayerId);
-      setBuzzedPlayerName(msg.buzzedPlayerName);
-      sound.playTick(true);
-
-      // Start visual 12-second countdown bar
-      setBuzzerTimeLeft(msg.timeLimit || 12);
-      if (buzzerCountdownRef.current) clearInterval(buzzerCountdownRef.current);
-      buzzerCountdownRef.current = setInterval(() => {
-        setBuzzerTimeLeft((prev) => {
-          if (!prev || prev <= 1) {
-            clearInterval(buzzerCountdownRef.current!);
-            return 0;
-          }
-          return prev - 1;
-        });
-      }, 1000);
-    }
-
-    if (msg.type === 'round_result') {
-      if (buzzerCountdownRef.current) clearInterval(buzzerCountdownRef.current);
-      setBuzzerTimeLeft(null);
-      setRoomPlayers(msg.players);
-
-      if (msg.isCorrect) {
-        sound.playCorrect();
-        setTimeout(() => sound.playStadiumRoar(), 200);
-        confetti({ particleCount: 70, spread: 60 });
-        setRoundResult(`إجابة صحيحة! اللاعب هو ${currentChallenge.name}`);
-      } else if (msg.isTimeout) {
-        sound.playWrong();
-        setRoundResult(`انتهى وقت البازر! نقطة مجانية للخصم.`);
-      } else {
-        sound.playWrong();
-        setRoundResult(`إجابة خاطئة! نقطة مجانية للطرف الآخر.`);
-      }
-    }
-
-    if (msg.type === 'new_round') {
-      if (buzzerCountdownRef.current) clearInterval(buzzerCountdownRef.current);
-      setBuzzerTimeLeft(null);
-      setCurrentRound(msg.currentRound);
-      if (msg.challenge) setServerChallenge(msg.challenge);
-      else if (msg.currentChallengeId) setServerChallengeId(msg.currentChallengeId);
-      setBuzzedPlayerId(null);
-      setRoundResult(null);
-      sound.playWhistle(true);
-    }
-
-    if (msg.type === 'game_over') {
-      if (buzzerCountdownRef.current) clearInterval(buzzerCountdownRef.current);
-      setRoomPlayers(msg.players);
-      setMode('game_over');
-      sound.playFanfare();
-      confetti({ particleCount: 150, spread: 100 });
+    // Anything that changes the game: re-read the room from the server right away
+    if (['room_joined', 'match_started', 'player_buzzed', 'round_result', 'new_round', 'game_over'].includes(msg.type)) {
+      if (msg.type === 'match_started' && msg.status) applySnapshot(msg);
+      else pollRoom();
     }
 
     if (msg.type === 'player_left') {
-      if (buzzerCountdownRef.current) clearInterval(buzzerCountdownRef.current);
+      stopCountdown();
       setBuzzerTimeLeft(null);
       sound.playWrong();
       flashNotice(msg.message || 'غادر الخصم المباراة! فزت بالمواجهة 🏆');
-      setRoundResult('غادر المنافس المباراة. تم احتساب الفوز لك! 🏆');
+      pollRoom();
     }
 
     if (msg.type === 'reaction') {
@@ -303,52 +421,33 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
     }
   };
 
-  // 1. Matchmaking Search for a Real Person
+  // 1. Matchmaking Search for a Real Person (same game type only)
   const handleFindMatch = async () => {
     sound.playClick();
     setIsBotMatch(false);
     localStorage.setItem('b11_my_player_name', playerName);
+    resetSyncState();
     setMode('finding_match');
 
-    // 1. Connect via WebSocket
-    try {
-      const ws = await connectWebSocket();
-      ws.send(JSON.stringify({ type: 'find_match', playerId, playerName }));
-    } catch {
-      // WS error will be handled by HTTP polling fallback
-    }
-
-    // 2. Start HTTP Matchmaking polling in parallel (ensures real opponents match under any network)
-    if (matchmakingPollRef.current) clearInterval(matchmakingPollRef.current);
-    matchmakingPollRef.current = setInterval(async () => {
+    const search = async () => {
       try {
-        const res = await fetch(apiUrl('/api/matchmaking/find'), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ playerId, playerName }),
-        });
-        if (res.ok) {
-          const data = await res.json();
-          if (data.status === 'matched') {
-            if (matchmakingPollRef.current) clearInterval(matchmakingPollRef.current);
-            setRoomId(data.roomId);
-            setRoomPlayers(data.players || []);
-            setCurrentRound(data.currentRound || 0);
-            if (data.challenge) setServerChallenge(data.challenge);
-            setBuzzedPlayerId(null);
-            setRoundResult(null);
-            setMode('playing');
-            sound.playWhistle(true);
-            flashNotice('تم العثور على خصم حقيقي! بدأت المباراة ⚡');
-          } else if (data.status === 'queued') {
-            if (typeof data.queueCount === 'number') setQueueCount(data.queueCount);
-            if (typeof data.onlineCount === 'number') setOnlineCount(data.onlineCount);
-          }
+        const { ok, data } = await postJson('/api/matchmaking/find', { playerId, playerName, gameType });
+        if (!ok || !data) return;
+        if (data.status === 'matched') {
+          if (matchmakingPollRef.current) clearInterval(matchmakingPollRef.current);
+          applySnapshot(data);
+        } else if (data.status === 'queued') {
+          if (typeof data.queueCount === 'number') setQueueCount(data.queueCount);
+          if (typeof data.onlineCount === 'number') setOnlineCount(data.onlineCount);
         }
       } catch {
         // network retry
       }
-    }, 1200);
+    };
+
+    if (matchmakingPollRef.current) clearInterval(matchmakingPollRef.current);
+    search();
+    matchmakingPollRef.current = setInterval(search, 1200);
   };
 
   // Cancel Matchmaking
@@ -358,11 +457,7 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
     if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
       socketRef.current.send(JSON.stringify({ type: 'leave_queue', playerId }));
     }
-    fetch(apiUrl('/api/matchmaking/leave'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId }),
-    }).catch(() => {});
+    postJson('/api/matchmaking/leave', { playerId }).catch(() => {});
     setMode('lobby');
   };
 
@@ -371,10 +466,12 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
     sound.playClick();
     setIsBotMatch(false);
     localStorage.setItem('b11_my_player_name', playerName);
+    resetSyncState();
 
     try {
-      const ws = await connectWebSocket();
-      ws.send(JSON.stringify({ type: 'create_room', playerId, playerName }));
+      const { ok, data } = await postJson('/api/rooms/create', { playerId, playerName, gameType });
+      if (!ok || !data) throw new Error('create failed');
+      applySnapshot(data);
     } catch {
       flashNotice('تعذر الاتصال بالسيرفر لإنشاء الغرفة.');
     }
@@ -382,22 +479,28 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
 
   // 3. Join Room
   const handleJoinRoom = async (codeToJoin?: string) => {
-    const code = codeToJoin || customRoomInput;
+    const code = (codeToJoin || customRoomInput || '').trim().toUpperCase();
     if (!code) return;
     sound.playClick();
     setIsBotMatch(false);
     localStorage.setItem('b11_my_player_name', playerName);
+    resetSyncState();
 
     try {
-      const ws = await connectWebSocket();
-      ws.send(JSON.stringify({ type: 'join_room', roomId: code.trim().toUpperCase(), playerId, playerName }));
+      const { ok, data } = await postJson('/api/rooms/join', { roomId: code, playerId, playerName });
+      if (!ok || !data || !data.status) {
+        sound.playWrong();
+        flashNotice((data && data.error) || 'تعذر الانضمام للغرفة.');
+        return;
+      }
+      applySnapshot(data);
     } catch {
       flashNotice('تعذر الاتصال بالسيرفر.');
     }
   };
 
   // 4. Start Match from Waiting Room
-  const handleStartMatch = () => {
+  const handleStartMatch = async () => {
     if (isBotMatch) {
       setMode('playing');
       setCurrentRound(0);
@@ -407,13 +510,20 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
       triggerBotTurn();
       return;
     }
-    if (!socketRef.current || !roomId) return;
-    socketRef.current.send(JSON.stringify({ type: 'start_match', roomId }));
+    if (!roomId) return;
+    try {
+      const { ok, data } = await postJson('/api/rooms/start', { roomId });
+      if (ok && data) applySnapshot(data);
+    } catch {
+      flashNotice('تعذر بدء المباراة، حاول مرة أخرى.');
+    }
   };
 
   // 5. Simulated Bot Match (Offline or Instant fallback)
   const handleStartTestMatch = () => {
     sound.playWhistle(true);
+    if (matchmakingPollRef.current) clearInterval(matchmakingPollRef.current);
+    resetSyncState();
     setIsBotMatch(true);
     const generatedRoom = 'B11-TEST' + Math.floor(100 + Math.random() * 900);
     setRoomId(generatedRoom);
@@ -423,7 +533,8 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
     ];
     setRoomPlayers(mockPlayers);
     setCurrentRound(0);
-    setServerChallengeId(playersList[0]?.id || 'salah');
+    setTotalRounds(5);
+    setServerChallenge(gameType === 'trivia' ? triviaList[0] : eyesList[0]);
     setBuzzedPlayerId(null);
     setRoundResult(null);
     setMode('playing');
@@ -462,19 +573,20 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
       });
     });
 
+    const correct = answerOf(challengeRef.current, gameTypeRef.current);
     if (isCorrect) {
       sound.playCorrect();
       setTimeout(() => sound.playStadiumRoar(), 200);
       confetti({ particleCount: 70, spread: 60 });
-      setRoundResult(`إجابة صحيحة! اللاعب هو ${currentChallenge.name}`);
+      setRoundResult(`إجابة صحيحة! ${gameTypeRef.current === 'trivia' ? 'الإجابة' : 'اللاعب هو'}: ${correct}`);
     } else {
       sound.playWrong();
-      setRoundResult(`إجابة خاطئة! نقطة مجانية للطرف الآخر.`);
+      setRoundResult(`إجابة خاطئة! نقطة مجانية للطرف الآخر. الإجابة الصحيحة: ${correct}`);
     }
   };
 
   // Buzzer Click
-  const handleBuzzer = () => {
+  const handleBuzzer = async () => {
     if (buzzedPlayerId !== null || roundResult) return;
 
     if (isBotMatch) {
@@ -485,38 +597,48 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
       return;
     }
 
-    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-      socketRef.current.send(JSON.stringify({ type: 'press_buzzer', roomId, playerId }));
+    sound.playClick();
+    // Show the press immediately; the server reply (or the next poll) confirms who really won
+    try {
+      const { ok, data } = await postJson('/api/matchmaking/buzz', { roomId, playerId });
+      if (ok && data) {
+        if (data.success) {
+          applySnapshot(await fetchSnapshot());
+        } else {
+          flashNotice('الخصم سبقك للبازر! ⚡');
+          pollRoom();
+        }
+      }
+    } catch {
+      flashNotice('تعذر الاتصال بالسيرفر، حاول مرة أخرى.');
     }
-    fetch(apiUrl('/api/matchmaking/buzz'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ roomId, playerId }),
-    }).catch(() => {});
+  };
+
+  const fetchSnapshot = async () => {
+    const res = await fetch(apiUrl(`/api/rooms/${encodeURIComponent(roomIdRef.current)}`), { cache: 'no-store' });
+    return res.ok ? await res.json() : null;
   };
 
   // Submit Answer
-  const handleAnswer = (option: string) => {
+  const handleAnswer = async (option: string) => {
     if (buzzedPlayerId !== playerId) return;
-    const isCorrect = option === currentChallenge.name;
+    const isCorrect = option === answerOf(currentChallenge, gameType);
 
     if (isBotMatch) {
       resolveRound(playerId, isCorrect);
       return;
     }
 
-    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-      socketRef.current.send(JSON.stringify({ type: 'submit_answer', roomId, playerId, isCorrect }));
+    try {
+      const { ok } = await postJson('/api/matchmaking/answer', { roomId, playerId, isCorrect });
+      if (ok) applySnapshot(await fetchSnapshot());
+    } catch {
+      flashNotice('تعذر إرسال الإجابة، حاول مرة أخرى.');
     }
-    fetch(apiUrl('/api/matchmaking/answer'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ roomId, playerId, isCorrect }),
-    }).catch(() => {});
   };
 
   // Next Round
-  const handleNextRound = () => {
+  const handleNextRound = async () => {
     if (isBotMatch) {
       const nextR = currentRound + 1;
       if (nextR >= 5) {
@@ -525,8 +647,7 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
         confetti({ particleCount: 150, spread: 100 });
       } else {
         setCurrentRound(nextR);
-        setServerChallengeId(playersList[nextR % playersList.length]?.id || 'salah');
-        setServerChallenge(null);
+        setServerChallenge(gameType === 'trivia' ? triviaList[nextR % triviaList.length] : eyesList[nextR % eyesList.length]);
         setBuzzedPlayerId(null);
         setRoundResult(null);
         sound.playWhistle(true);
@@ -535,14 +656,12 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
       return;
     }
 
-    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-      socketRef.current.send(JSON.stringify({ type: 'next_round', roomId }));
+    try {
+      const { ok } = await postJson('/api/matchmaking/next', { roomId });
+      if (ok) applySnapshot(await fetchSnapshot());
+    } catch {
+      flashNotice('تعذر الانتقال للجولة التالية، حاول مرة أخرى.');
     }
-    fetch(apiUrl('/api/matchmaking/next'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ roomId }),
-    }).catch(() => {});
   };
 
   // Live Reactions
@@ -551,7 +670,7 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
     setActiveReaction({ emoji, from: playerId });
     setTimeout(() => setActiveReaction(null), 2500);
 
-    if (!isBotMatch && socketRef.current && roomId) {
+    if (!isBotMatch && socketRef.current && socketRef.current.readyState === WebSocket.OPEN && roomId) {
       socketRef.current.send(JSON.stringify({ type: 'send_reaction', roomId, playerId, emoji }));
     }
   };
@@ -661,13 +780,49 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
             />
           </div>
 
+          {/* Game type: trivia or eyes challenge */}
+          <div className="w-full mb-4">
+            <label className="block text-xs font-bold text-gray-300 mb-1">اختر نوع التحدي:</label>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => chooseGameType('trivia')}
+                className={`p-3 rounded-2xl border-2 text-center transition cursor-pointer active:scale-95 ${
+                  gameType === 'trivia'
+                    ? 'bg-amber-400/15 border-amber-400 text-amber-300 shadow-[0_0_18px_rgba(251,191,36,0.35)]'
+                    : 'bg-black/50 border-white/10 text-gray-300 hover:border-amber-400/50'
+                }`}
+              >
+                <span className="block text-2xl mb-0.5">🧠</span>
+                <span className="block text-sm font-black">الفوازير</span>
+                <span className="block text-[10px] text-gray-400">أسئلة ثقافة كروية</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => chooseGameType('eyes')}
+                className={`p-3 rounded-2xl border-2 text-center transition cursor-pointer active:scale-95 ${
+                  gameType === 'eyes'
+                    ? 'bg-cyan-400/15 border-cyan-400 text-cyan-300 shadow-[0_0_18px_rgba(34,211,238,0.35)]'
+                    : 'bg-black/50 border-white/10 text-gray-300 hover:border-cyan-400/50'
+                }`}
+              >
+                <span className="block text-2xl mb-0.5">👁️</span>
+                <span className="block text-sm font-black">تحدي العيون</span>
+                <span className="block text-[10px] text-gray-400">خمّن اللاعب من عينيه</span>
+              </button>
+            </div>
+            <p className="text-[10px] text-gray-500 text-center mt-1.5">
+              البحث التلقائي يطابقك مع لاعب اختار نفس التحدي.
+            </p>
+          </div>
+
           {/* MAIN ACTION: Search for Real Person */}
           <button
             onClick={handleFindMatch}
             className="w-full py-3.5 rounded-2xl bg-gradient-to-r from-emerald-400 via-lime-400 to-cyan-400 hover:brightness-110 text-black font-black text-sm flex items-center justify-center gap-2 shadow-[0_0_30px_rgba(52,211,153,0.4)] active:scale-95 transition cursor-pointer mb-3"
           >
             <Globe className="w-5 h-5 text-black" />
-            <span>البحث التلقائي عن شخص حقيقي أونلاين ⚡</span>
+            <span>البحث عن شخص حقيقي ({isTrivia ? 'الفوازير' : 'تحدي العيون'}) ⚡</span>
           </button>
 
           {/* Create Room For Friend */}
@@ -730,7 +885,9 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
                   >
                     <div>
                       <span className="text-xs font-bold text-white block">{r.hostName}</span>
-                      <span className="text-[10px] text-gray-400 font-mono">{r.id}</span>
+                      <span className="text-[10px] text-gray-400 font-mono">
+                        {r.id} · {r.gameType === 'trivia' ? '🧠 فوازير' : '👁️ عيون'}
+                      </span>
                     </div>
                     <button
                       onClick={() => handleJoinRoom(r.id)}
@@ -837,6 +994,9 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
           </div>
 
           <h3 className="text-lg font-black text-white mb-1">غرفة التحدي الخاصة جاهزة!</h3>
+          <span className="text-[11px] font-bold text-cyan-300 mb-2">
+            نوع التحدي: {isTrivia ? '🧠 الفوازير' : '👁️ تحدي العيون'}
+          </span>
           <span className="text-xs font-mono font-black text-lime-400 bg-lime-950 px-3 py-1 rounded-full border border-lime-500/30 mb-4">
             رمز الغرفة: {roomId}
           </span>
@@ -969,15 +1129,29 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
 
           {/* Round Indicator */}
           <div className="w-full flex items-center justify-between px-2 mb-2 text-xs font-bold text-gray-400">
-            <span>الجولة: {currentRound + 1} من 5</span>
-            <span className="text-cyan-400">من يملك هذه العيون؟</span>
+            <span>الجولة: {currentRound + 1} من {isBotMatch ? 5 : totalRounds}</span>
+            <span className="text-cyan-400">{isTrivia ? 'فوازير كروية 🧠' : 'من يملك هذه العيون؟'}</span>
           </div>
 
-          <PlayerEyeViewer
-            player={currentChallenge}
-            revealLevel={roundResult ? 'full' : 'eyes'}
-            canRevealMore={false}
-          />
+          {isTrivia ? (
+            <div className="w-full p-5 rounded-3xl bg-gradient-to-b from-neutral-900 to-black border border-amber-400/40 text-center shadow-xl">
+              <span className="inline-block mb-2 px-3 py-0.5 rounded-full bg-amber-400/15 border border-amber-400/40 text-[10px] font-bold text-amber-300">
+                {asTrivia(currentChallenge).category || 'فوازير'} · {asTrivia(currentChallenge).difficulty || ''}
+              </span>
+              <p className="text-base sm:text-lg font-black text-white leading-relaxed">
+                {asTrivia(currentChallenge).question}
+              </p>
+              {roundResult && asTrivia(currentChallenge).explanation && (
+                <p className="mt-3 text-xs text-gray-300 leading-relaxed">{asTrivia(currentChallenge).explanation}</p>
+              )}
+            </div>
+          ) : (
+            <PlayerEyeViewer
+              player={asPlayer(currentChallenge)}
+              revealLevel={roundResult ? 'full' : 'eyes'}
+              canRevealMore={false}
+            />
+          )}
 
           <div className="flex items-center gap-2 my-2">
             <span className="text-[10px] text-gray-400">تفاعل سريع:</span>
@@ -1028,7 +1202,7 @@ export const OnlineArena: React.FC<OnlineArenaProps> = ({
               )}
 
               <div className="w-full grid grid-cols-2 gap-2">
-                {currentChallenge.options.map((opt, i) => (
+                {optionsOf(currentChallenge).map((opt, i) => (
                   <button
                     key={i}
                     onClick={() => handleAnswer(opt)}

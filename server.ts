@@ -83,36 +83,77 @@ function getFullPlayersList(): FootballPlayer[] {
   return [...serverCustomPlayers, ...baseFiltered];
 }
 
-// Online Arena Data Structures
+// ---------------------------------------------------------------------------
+// Online Arena (1 vs 1 rooms, matchmaking, buzzer rounds)
+// ---------------------------------------------------------------------------
+// Every client talks to the arena over BOTH a WebSocket and plain HTTP (the HTTP
+// calls are a fallback for networks where sockets are flaky). The same action can
+// therefore reach the server twice, so every state change below is idempotent:
+// it only applies when the room is in the state the action expects.
+
+type GameType = 'eyes' | 'trivia';
+
 interface OnlinePlayer {
   id: string;
   name: string;
   score: number;
-  ws: WebSocket;
+  // null for a player who joined through the HTTP fallback and has not opened a
+  // socket yet; the socket is attached as soon as that player sends a socket message.
+  ws: WebSocket | null;
   isHost: boolean;
 }
 
 interface GameRoom {
   id: string;
+  gameType: GameType;
   players: OnlinePlayer[];
   status: 'waiting' | 'playing' | 'round_buzzed' | 'round_finished' | 'game_over';
   currentRound: number;
   totalRounds: number;
   buzzedPlayerId: string | null;
+  buzzedPlayerName: string | null;
   lastWinnerId: string | null;
+  lastResult: { isCorrect: boolean; isTimeout: boolean } | null;
   challengeIds: string[];
   currentChallengeId: string;
   buzzerTimer: NodeJS.Timeout | null;
+  createdAt: number;
+}
+
+interface QueueEntry {
+  ws: WebSocket | null;
+  playerId: string;
+  playerName: string;
+  gameType: GameType;
+  seenAt: number;
 }
 
 const rooms = new Map<string, GameRoom>();
-let matchmakingQueue: { ws: WebSocket; playerId: string; playerName: string }[] = [];
+let matchmakingQueue: QueueEntry[] = [];
 
-// Broadcast helper to all players in a room
-function broadcastToRoom(room: GameRoom, data: any) {
+const BUZZER_SECONDS = 12;
+const QUEUE_HTTP_TTL_MS = 8000;
+const ROUND_COUNT = 5;
+
+function normalizeGameType(value: unknown): GameType {
+  return value === 'trivia' ? 'trivia' : 'eyes';
+}
+
+function publicPlayers(room: GameRoom) {
+  return room.players.map((p) => ({ id: p.id, name: p.name, score: p.score, isHost: p.isHost }));
+}
+
+function sendTo(ws: WebSocket | null | undefined, data: unknown) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(data));
+  }
+}
+
+// Broadcast helper to all players in a room (skips players without a live socket)
+function broadcastToRoom(room: GameRoom, data: unknown) {
   const message = JSON.stringify(data);
   room.players.forEach((player) => {
-    if (player.ws.readyState === WebSocket.OPEN) {
+    if (player.ws && player.ws.readyState === WebSocket.OPEN) {
       player.ws.send(message);
     }
   });
@@ -128,36 +169,229 @@ function broadcastGlobal(data: any) {
   });
 }
 
+// Pick random unique challenge IDs: players for the eyes challenge, questions for trivia
+function pickRandomChallengeIds(gameType: GameType, count = ROUND_COUNT): string[] {
+  const all: { id: string }[] = gameType === 'trivia' ? getFullTriviaList() : getFullPlayersList();
+  const shuffled = [...all].sort(() => Math.random() - 0.5);
+  return shuffled.slice(0, count).map((item) => item.id);
+}
+
+function getChallenge(room: GameRoom, id: string = room.currentChallengeId) {
+  const list: { id: string }[] = room.gameType === 'trivia' ? getFullTriviaList() : getFullPlayersList();
+  return list.find((item) => item.id === id) || list[0];
+}
+
+function newRoomId(): string {
+  let id = '';
+  do {
+    id = 'B11-' + Math.floor(1000 + Math.random() * 9000);
+  } while (rooms.has(id));
+  return id;
+}
+
+function createRoom(opts: {
+  id?: string;
+  gameType: GameType;
+  players: OnlinePlayer[];
+  status: GameRoom['status'];
+}): GameRoom {
+  const challengeIds = pickRandomChallengeIds(opts.gameType, ROUND_COUNT);
+  const room: GameRoom = {
+    id: opts.id && !rooms.has(opts.id) ? opts.id : newRoomId(),
+    gameType: opts.gameType,
+    players: opts.players,
+    status: opts.status,
+    currentRound: 0,
+    totalRounds: Math.max(1, Math.min(ROUND_COUNT, challengeIds.length)),
+    buzzedPlayerId: null,
+    buzzedPlayerName: null,
+    lastWinnerId: null,
+    lastResult: null,
+    challengeIds,
+    currentChallengeId: challengeIds[0] || '',
+    buzzerTimer: null,
+    createdAt: Date.now(),
+  };
+  rooms.set(room.id, room);
+  return room;
+}
+
+// Everything a client needs to (re)build its view of a room
+function roomSnapshot(room: GameRoom) {
+  return {
+    roomId: room.id,
+    gameType: room.gameType,
+    status: room.status,
+    players: publicPlayers(room),
+    currentRound: room.currentRound,
+    totalRounds: room.totalRounds,
+    currentChallengeId: room.currentChallengeId,
+    challenge: getChallenge(room),
+    buzzedPlayerId: room.buzzedPlayerId,
+    buzzedPlayerName: room.buzzedPlayerName,
+    lastWinnerId: room.lastWinnerId,
+    lastResult: room.lastResult,
+  };
+}
+
+function clearBuzzTimer(room: GameRoom) {
+  if (room.buzzerTimer) {
+    clearTimeout(room.buzzerTimer);
+    room.buzzerTimer = null;
+  }
+}
+
+function startRoom(room: GameRoom) {
+  clearBuzzTimer(room);
+  room.status = 'playing';
+  room.currentRound = 0;
+  room.buzzedPlayerId = null;
+  room.buzzedPlayerName = null;
+  room.lastWinnerId = null;
+  room.lastResult = null;
+  room.currentChallengeId = room.challengeIds[0] || '';
+  broadcastToRoom(room, { type: 'match_started', ...roomSnapshot(room) });
+}
+
+function finishRound(room: GameRoom, answeringPlayerId: string, isCorrect: boolean, isTimeout: boolean) {
+  clearBuzzTimer(room);
+  room.status = 'round_finished';
+
+  const answering = room.players.find((p) => p.id === answeringPlayerId);
+  const other = room.players.find((p) => p.id !== answeringPlayerId);
+
+  if (isCorrect) {
+    if (answering) answering.score += 100;
+    room.lastWinnerId = answeringPlayerId;
+  } else {
+    if (other) other.score += 50;
+    room.lastWinnerId = other ? other.id : null;
+  }
+  room.lastResult = { isCorrect, isTimeout };
+
+  broadcastToRoom(room, {
+    type: 'round_result',
+    isCorrect,
+    isTimeout,
+    lastWinnerId: room.lastWinnerId,
+    players: publicPlayers(room),
+  });
+}
+
+// First player to press wins the right to answer. Pressing again as the same
+// player is a no-op that still reports success (WebSocket + HTTP both send it).
+function buzzIn(room: GameRoom, playerId: string): boolean {
+  if (room.status === 'round_buzzed' && room.buzzedPlayerId === playerId) return true;
+  if (room.status !== 'playing' || room.buzzedPlayerId !== null) return false;
+
+  const player = room.players.find((p) => p.id === playerId);
+  if (!player) return false;
+
+  room.status = 'round_buzzed';
+  room.buzzedPlayerId = playerId;
+  room.buzzedPlayerName = player.name;
+
+  broadcastToRoom(room, {
+    type: 'player_buzzed',
+    buzzedPlayerId: playerId,
+    buzzedPlayerName: player.name,
+    timeLimit: BUZZER_SECONDS,
+  });
+
+  // Timeout fallback: no answer within the time limit
+  clearBuzzTimer(room);
+  room.buzzerTimer = setTimeout(() => {
+    if (room.status === 'round_buzzed' && room.buzzedPlayerId === playerId) {
+      finishRound(room, playerId, false, true);
+    }
+  }, (BUZZER_SECONDS + 0.5) * 1000);
+
+  return true;
+}
+
+// Only the player who buzzed can answer, and only once per round.
+function submitAnswer(room: GameRoom, playerId: string, isCorrect: boolean): boolean {
+  if (room.status !== 'round_buzzed' || room.buzzedPlayerId !== playerId) return false;
+  finishRound(room, playerId, !!isCorrect, false);
+  return true;
+}
+
+// Only moves on from a finished round, so two "next round" requests for the same
+// round (socket + HTTP, or both players) advance it once.
+function advanceRound(room: GameRoom): boolean {
+  if (room.status !== 'round_finished') return false;
+
+  clearBuzzTimer(room);
+  room.currentRound += 1;
+  room.buzzedPlayerId = null;
+  room.buzzedPlayerName = null;
+  room.lastWinnerId = null;
+  room.lastResult = null;
+
+  if (room.currentRound >= room.totalRounds) {
+    room.status = 'game_over';
+    broadcastToRoom(room, { type: 'game_over', players: publicPlayers(room) });
+  } else {
+    room.status = 'playing';
+    room.currentChallengeId = room.challengeIds[room.currentRound] || '';
+    broadcastToRoom(room, {
+      type: 'new_round',
+      currentRound: room.currentRound,
+      currentChallengeId: room.currentChallengeId,
+      challenge: getChallenge(room),
+      players: publicPlayers(room),
+    });
+  }
+  return true;
+}
+
+function removePlayerFromRoom(room: GameRoom, playerId: string) {
+  const idx = room.players.findIndex((p) => p.id === playerId);
+  if (idx === -1) return;
+
+  const leaving = room.players[idx];
+  clearBuzzTimer(room);
+  room.players.splice(idx, 1);
+
+  if (room.players.length === 0) {
+    rooms.delete(room.id);
+    return;
+  }
+  if (room.status === 'game_over') return;
+
+  const remaining = room.players[0];
+  if (room.status !== 'waiting') {
+    room.status = 'game_over';
+  }
+  broadcastToRoom(room, {
+    type: 'player_left',
+    message: `غادر اللاعب ${leaving.name} المباراة`,
+    winnerId: remaining.id,
+    winnerName: remaining.name,
+    players: publicPlayers(room),
+  });
+}
+
 // Clean disconnected or leaving players
 function cleanPlayerFromRooms(ws: WebSocket) {
   // 1. Remove from matchmaking queue
-  matchmakingQueue = matchmakingQueue.filter((p) => p.ws !== ws && p.ws.readyState === WebSocket.OPEN);
+  matchmakingQueue = matchmakingQueue.filter((p) => p.ws !== ws);
 
   // 2. Remove from active rooms
-  rooms.forEach((room, roomId) => {
-    const pIdx = room.players.findIndex((p) => p.ws === ws);
-    if (pIdx !== -1) {
-      const leavingPlayer = room.players[pIdx];
-      if (room.buzzerTimer) clearTimeout(room.buzzerTimer);
-      room.players.splice(pIdx, 1);
-
-      if (room.players.length === 0) {
-        rooms.delete(roomId);
-      } else {
-        const remainingPlayer = room.players[0];
-        broadcastToRoom(room, {
-          type: 'player_left',
-          message: `غادر اللاعب ${leavingPlayer.name} المباراة`,
-          winnerId: remainingPlayer.id,
-          winnerName: remainingPlayer.name,
-          players: room.players.map((p) => ({ id: p.id, name: p.name, score: p.score, isHost: p.isHost })),
-        });
-      }
-    }
+  Array.from(rooms.values()).forEach((room) => {
+    const player = room.players.find((p) => p.ws === ws);
+    if (player) removePlayerFromRoom(room, player.id);
   });
 
   // Notify remaining queue users of updated queue count
   broadcastQueueStatus();
+}
+
+function pruneQueue() {
+  const now = Date.now();
+  matchmakingQueue = matchmakingQueue.filter((p) =>
+    p.ws ? p.ws.readyState === WebSocket.OPEN : now - p.seenAt < QUEUE_HTTP_TTL_MS
+  );
 }
 
 function broadcastQueueStatus() {
@@ -166,18 +400,65 @@ function broadcastQueueStatus() {
     queueCount: matchmakingQueue.length,
     onlineCount: wss.clients.size,
   };
-  matchmakingQueue.forEach((item) => {
-    if (item.ws.readyState === WebSocket.OPEN) {
-      item.ws.send(JSON.stringify(payload));
-    }
-  });
+  matchmakingQueue.forEach((item) => sendTo(item.ws, payload));
 }
 
-// Pick 5 random unique challenge IDs from available players list
-function pickRandomChallengeIds(count = 5): string[] {
-  const all = getFullPlayersList();
-  const shuffled = [...all].sort(() => Math.random() - 0.5);
-  return shuffled.slice(0, count).map((p) => p.id);
+function findActiveRoomFor(playerId: string): GameRoom | null {
+  const active = Array.from(rooms.values()).find(
+    (room) =>
+      room.status !== 'waiting' &&
+      room.status !== 'game_over' &&
+      room.players.some((p) => p.id === playerId)
+  );
+  return active || null;
+}
+
+// Pair the caller with a waiting player of the same game type, or put the caller in
+// the queue. `created` is true only for a room made by this very call.
+function matchOrQueue(
+  playerId: string,
+  playerName: string,
+  gameType: GameType,
+  ws: WebSocket | null
+): { room: GameRoom | null; created: boolean } {
+  pruneQueue();
+
+  // Someone else may already have matched this player (their HTTP poll finds out here)
+  const active = findActiveRoomFor(playerId);
+  if (active) {
+    const me = active.players.find((p) => p.id === playerId);
+    if (me && ws) me.ws = ws;
+    return { room: active, created: false };
+  }
+
+  const mine = matchmakingQueue.find((p) => p.playerId === playerId);
+  const myWs = ws || mine?.ws || null;
+
+  const opponentIdx = matchmakingQueue.findIndex((p) => p.playerId !== playerId && p.gameType === gameType);
+  if (opponentIdx !== -1) {
+    const opponent = matchmakingQueue.splice(opponentIdx, 1)[0];
+    matchmakingQueue = matchmakingQueue.filter((p) => p.playerId !== playerId);
+
+    const room = createRoom({
+      gameType,
+      status: 'playing',
+      players: [
+        { id: opponent.playerId, name: opponent.playerName, score: 0, ws: opponent.ws, isHost: true },
+        { id: playerId, name: playerName, score: 0, ws: myWs, isHost: false },
+      ],
+    });
+    console.log(`[Arena] Real match created: ${room.id} (${gameType}) ${opponent.playerName} vs ${playerName}`);
+    return { room, created: true };
+  }
+
+  matchmakingQueue = matchmakingQueue.filter((p) => p.playerId !== playerId);
+  matchmakingQueue.push({ ws: myWs, playerId, playerName, gameType, seenAt: Date.now() });
+  return { room: null, created: false };
+}
+
+function announceMatch(room: GameRoom) {
+  room.status = 'playing';
+  broadcastToRoom(room, { type: 'match_started', ...roomSnapshot(room) });
 }
 
 // WebSocket Server for Realtime Arena & Global Event Broadcasting
@@ -205,6 +486,146 @@ setInterval(() => {
   });
 }, 30000);
 
+// Drop rooms nobody finished and stale queue entries
+setInterval(() => {
+  const cutoff = Date.now() - 3 * 60 * 60 * 1000;
+  Array.from(rooms.values()).forEach((room) => {
+    if (room.createdAt < cutoff) {
+      clearBuzzTimer(room);
+      rooms.delete(room.id);
+    }
+  });
+  pruneQueue();
+}, 10 * 60 * 1000);
+
+function handleSocketMessage(ws: WebSocket, data: any) {
+  // Any message that names a room + player (re)attaches this socket to that player,
+  // so a player who was matched over HTTP starts receiving live events.
+  if (data && data.roomId && data.playerId) {
+    const room = rooms.get(data.roomId);
+    const player = room?.players.find((p) => p.id === data.playerId);
+    if (player && player.ws !== ws) player.ws = ws;
+  }
+
+  switch (data?.type) {
+    // 1. Quick matchmaking for real players
+    case 'find_match': {
+      const { playerId, playerName } = data;
+      if (!playerId) return;
+      const result = matchOrQueue(playerId, playerName || 'لاعب', normalizeGameType(data.gameType), ws);
+
+      if (result.room && result.created) {
+        announceMatch(result.room);
+      } else if (result.room) {
+        sendTo(ws, { type: 'match_started', ...roomSnapshot(result.room) });
+      } else {
+        sendTo(ws, {
+          type: 'queued',
+          message: 'جاري البحث عن لاعب حقيقي أونلاين...',
+          queueCount: matchmakingQueue.length,
+          onlineCount: wss.clients.size,
+        });
+        broadcastQueueStatus();
+      }
+      break;
+    }
+
+    // 2. Leave queue
+    case 'leave_queue': {
+      matchmakingQueue = matchmakingQueue.filter((p) => p.playerId !== data.playerId);
+      broadcastQueueStatus();
+      sendTo(ws, { type: 'left_queue' });
+      break;
+    }
+
+    // 3. Create private/custom room
+    case 'create_room': {
+      const { playerId, playerName } = data;
+      if (!playerId) return;
+      const room = createRoom({
+        id: data.roomId,
+        gameType: normalizeGameType(data.gameType),
+        status: 'waiting',
+        players: [{ id: playerId, name: playerName || 'المضيف', score: 0, ws, isHost: true }],
+      });
+      sendTo(ws, { type: 'room_created', roomId: room.id, gameType: room.gameType, players: publicPlayers(room) });
+      break;
+    }
+
+    // 4. Join custom room
+    case 'join_room': {
+      const { playerId, playerName, roomId } = data;
+      const room = rooms.get(roomId);
+      if (!room) {
+        sendTo(ws, { type: 'error', message: 'رمز الغرفة غير موجود أو تم إغلاقها' });
+        return;
+      }
+
+      const existing = room.players.find((p) => p.id === playerId);
+      if (existing) {
+        existing.ws = ws;
+      } else if (room.status !== 'waiting' || room.players.length >= 2) {
+        sendTo(ws, { type: 'error', message: 'الغرفة ممتلئة أو بدأت المباراة بالفعل' });
+        return;
+      } else {
+        room.players.push({ id: playerId, name: playerName || 'لاعب منافس', score: 0, ws, isHost: false });
+      }
+
+      broadcastToRoom(room, {
+        type: 'room_joined',
+        roomId: room.id,
+        gameType: room.gameType,
+        players: publicPlayers(room),
+        status: room.status,
+        currentRound: room.currentRound,
+        currentChallengeId: room.currentChallengeId,
+      });
+      break;
+    }
+
+    // 5. Start match (from waiting room)
+    case 'start_match': {
+      const room = rooms.get(data.roomId);
+      if (room && room.status === 'waiting' && room.players.length >= 2) startRoom(room);
+      break;
+    }
+
+    // 6. Explicitly attach this socket to a room (HTTP-matched players)
+    case 'attach_room':
+      break; // handled by the attach step above
+
+    // 7. Buzzer press (server timer limits the answer time)
+    case 'press_buzzer': {
+      const room = rooms.get(data.roomId);
+      if (room) buzzIn(room, data.playerId);
+      break;
+    }
+
+    // 8. Submit answer
+    case 'submit_answer': {
+      const room = rooms.get(data.roomId);
+      if (room) submitAnswer(room, data.playerId, !!data.isCorrect);
+      break;
+    }
+
+    // 9. Next round
+    case 'next_round': {
+      const room = rooms.get(data.roomId);
+      if (room) advanceRound(room);
+      break;
+    }
+
+    // 10. Live reaction emote
+    case 'send_reaction': {
+      const room = rooms.get(data.roomId);
+      if (room) {
+        broadcastToRoom(room, { type: 'reaction', playerId: data.playerId, emoji: data.emoji });
+      }
+      break;
+    }
+  }
+}
+
 wss.on('connection', (ws: WebSocket) => {
   (ws as any).isAlive = true;
   ws.on('pong', () => {
@@ -212,268 +633,21 @@ wss.on('connection', (ws: WebSocket) => {
   });
 
   // Send initial online count
-  ws.send(JSON.stringify({
+  sendTo(ws, {
     type: 'server_hello',
     onlineCount: wss.clients.size,
     queueCount: matchmakingQueue.length,
-  }));
+  });
 
   ws.on('message', (raw) => {
+    let data: any;
     try {
-      const data = JSON.parse(raw.toString());
-
-      // 1. Quick Matchmaking Queue for Real Players
-      if (data.type === 'find_match') {
-        const { playerId, playerName } = data;
-
-        // Clean out dead sockets first
-        matchmakingQueue = matchmakingQueue.filter((p) => p.ws.readyState === WebSocket.OPEN);
-
-        // Check if an available real opponent is waiting
-        const opponentIdx = matchmakingQueue.findIndex(
-          (p) => p.playerId !== playerId && p.ws.readyState === WebSocket.OPEN
-        );
-
-        if (opponentIdx !== -1) {
-          const opponent = matchmakingQueue.splice(opponentIdx, 1)[0];
-          const roomId = 'B11-' + Math.floor(1000 + Math.random() * 9000);
-          const challengeIds = pickRandomChallengeIds(5);
-          const firstChallenge = getFullPlayersList().find((p) => p.id === challengeIds[0]) || getFullPlayersList()[0];
-
-          const newRoom: GameRoom = {
-            id: roomId,
-            players: [
-              { id: opponent.playerId, name: opponent.playerName, score: 0, ws: opponent.ws, isHost: true },
-              { id: playerId, name: playerName || 'لاعب 2', score: 0, ws, isHost: false },
-            ],
-            status: 'playing',
-            currentRound: 0,
-            totalRounds: 5,
-            buzzedPlayerId: null,
-            lastWinnerId: null,
-            challengeIds,
-            currentChallengeId: challengeIds[0] || 'salah',
-            buzzerTimer: null,
-          };
-          rooms.set(roomId, newRoom);
-
-          console.log(`[Arena] Real Match Created: ${roomId} between ${opponent.playerName} & ${playerName}`);
-
-          broadcastToRoom(newRoom, {
-            type: 'match_started',
-            roomId,
-            players: newRoom.players.map((p) => ({ id: p.id, name: p.name, score: p.score, isHost: p.isHost })),
-            currentRound: 0,
-            currentChallengeId: newRoom.currentChallengeId,
-            challenge: firstChallenge,
-            totalRounds: 5,
-            status: 'playing',
-          });
-        } else {
-          // Remove if player already in queue to avoid duplicates
-          matchmakingQueue = matchmakingQueue.filter((p) => p.playerId !== playerId);
-          matchmakingQueue.push({ ws, playerId, playerName: playerName || 'لاعب' });
-
-          ws.send(JSON.stringify({
-            type: 'queued',
-            message: 'جاري البحث عن لاعب حقيقي أونلاين...',
-            queueCount: matchmakingQueue.length,
-            onlineCount: wss.clients.size,
-          }));
-
-          broadcastQueueStatus();
-        }
-      }
-
-      // 2. Leave Queue
-      if (data.type === 'leave_queue') {
-        matchmakingQueue = matchmakingQueue.filter((p) => p.playerId !== data.playerId);
-        broadcastQueueStatus();
-        ws.send(JSON.stringify({ type: 'left_queue' }));
-      }
-
-      // 3. Create Private/Custom Room
-      if (data.type === 'create_room') {
-        const { playerId, playerName, roomId: customRoomId } = data;
-        const roomId = customRoomId || 'B11-' + Math.floor(1000 + Math.random() * 9000);
-        const challengeIds = pickRandomChallengeIds(5);
-
-        const newRoom: GameRoom = {
-          id: roomId,
-          players: [{ id: playerId, name: playerName || 'المضيف', score: 0, ws, isHost: true }],
-          status: 'waiting',
-          currentRound: 0,
-          totalRounds: 5,
-          buzzedPlayerId: null,
-          lastWinnerId: null,
-          challengeIds,
-          currentChallengeId: challengeIds[0] || 'salah',
-          buzzerTimer: null,
-        };
-        rooms.set(roomId, newRoom);
-
-        ws.send(JSON.stringify({
-          type: 'room_created',
-          roomId,
-          players: newRoom.players.map((p) => ({ id: p.id, name: p.name, score: p.score, isHost: p.isHost })),
-        }));
-      }
-
-      // 4. Join Custom Room
-      if (data.type === 'join_room') {
-        const { playerId, playerName, roomId } = data;
-
-        const room = rooms.get(roomId);
-        if (!room) {
-          ws.send(JSON.stringify({ type: 'error', message: 'رمز الغرفة غير موجود أو تم إغلاقها' }));
-          return;
-        }
-
-        const existing = room.players.find((p) => p.id === playerId);
-        if (existing) {
-          existing.ws = ws;
-        } else {
-          room.players.push({ id: playerId, name: playerName || 'لاعب منافس', score: 0, ws, isHost: false });
-        }
-
-        broadcastToRoom(room, {
-          type: 'room_joined',
-          roomId,
-          players: room.players.map((p) => ({ id: p.id, name: p.name, score: p.score, isHost: p.isHost })),
-          status: room.status,
-          currentRound: room.currentRound,
-          currentChallengeId: room.currentChallengeId,
-        });
-      }
-
-      // 5. Start Match (from Waiting Room)
-      if (data.type === 'start_match') {
-        const { roomId } = data;
-        const room = rooms.get(roomId);
-        if (room) {
-          room.status = 'playing';
-          room.currentRound = 0;
-          room.buzzedPlayerId = null;
-          room.currentChallengeId = room.challengeIds[0] || 'salah';
-
-          broadcastToRoom(room, {
-            type: 'match_started',
-            roomId,
-            currentRound: 0,
-            currentChallengeId: room.currentChallengeId,
-            totalRounds: room.totalRounds,
-            players: room.players.map((p) => ({ id: p.id, name: p.name, score: p.score, isHost: p.isHost })),
-            status: 'playing',
-          });
-        }
-      }
-
-      // 6. Buzzer Press with Server Timer (12s limit)
-      if (data.type === 'press_buzzer') {
-        const { roomId, playerId } = data;
-        const room = rooms.get(roomId);
-        if (room && room.status === 'playing' && room.buzzedPlayerId === null) {
-          room.buzzedPlayerId = playerId;
-          room.status = 'round_buzzed';
-          const buzzedPlayer = room.players.find((p) => p.id === playerId);
-
-          broadcastToRoom(room, {
-            type: 'player_buzzed',
-            buzzedPlayerId: playerId,
-            buzzedPlayerName: buzzedPlayer ? buzzedPlayer.name : 'لاعب',
-            timeLimit: 12,
-          });
-
-          // Timeout fallback: if no answer submitted within 12 seconds
-          if (room.buzzerTimer) clearTimeout(room.buzzerTimer);
-          room.buzzerTimer = setTimeout(() => {
-            if (room.status === 'round_buzzed' && room.buzzedPlayerId === playerId) {
-              room.status = 'round_finished';
-              const opponent = room.players.find((p) => p.id !== playerId);
-              if (opponent) opponent.score += 50;
-              room.lastWinnerId = opponent ? opponent.id : null;
-
-              broadcastToRoom(room, {
-                type: 'round_result',
-                isCorrect: false,
-                isTimeout: true,
-                lastWinnerId: room.lastWinnerId,
-                players: room.players.map((p) => ({ id: p.id, name: p.name, score: p.score, isHost: p.isHost })),
-              });
-            }
-          }, 12500);
-        }
-      }
-
-      // 7. Submit Answer
-      if (data.type === 'submit_answer') {
-        const { roomId, playerId, isCorrect } = data;
-        const room = rooms.get(roomId);
-        if (room) {
-          if (room.buzzerTimer) clearTimeout(room.buzzerTimer);
-          room.status = 'round_finished';
-
-          if (isCorrect) {
-            const player = room.players.find((p) => p.id === playerId);
-            if (player) player.score += 100;
-            room.lastWinnerId = playerId;
-          } else {
-            const opponent = room.players.find((p) => p.id !== playerId);
-            if (opponent) opponent.score += 50;
-            room.lastWinnerId = opponent ? opponent.id : null;
-          }
-
-          broadcastToRoom(room, {
-            type: 'round_result',
-            isCorrect,
-            lastWinnerId: room.lastWinnerId,
-            players: room.players.map((p) => ({ id: p.id, name: p.name, score: p.score, isHost: p.isHost })),
-          });
-        }
-      }
-
-      // 8. Next Round
-      if (data.type === 'next_round') {
-        const { roomId } = data;
-        const room = rooms.get(roomId);
-        if (room) {
-          if (room.buzzerTimer) clearTimeout(room.buzzerTimer);
-          room.currentRound += 1;
-          room.buzzedPlayerId = null;
-
-          if (room.currentRound >= room.totalRounds) {
-            room.status = 'game_over';
-            broadcastToRoom(room, {
-              type: 'game_over',
-              players: room.players.map((p) => ({ id: p.id, name: p.name, score: p.score, isHost: p.isHost })),
-            });
-          } else {
-            room.status = 'playing';
-            room.currentChallengeId = room.challengeIds[room.currentRound] || 'salah';
-            const nextChallenge = getFullPlayersList().find((p) => p.id === room.currentChallengeId) || getFullPlayersList()[0];
-            broadcastToRoom(room, {
-              type: 'new_round',
-              currentRound: room.currentRound,
-              currentChallengeId: room.currentChallengeId,
-              challenge: nextChallenge,
-              players: room.players.map((p) => ({ id: p.id, name: p.name, score: p.score, isHost: p.isHost })),
-            });
-          }
-        }
-      }
-
-      // 9. Live Reaction Emote
-      if (data.type === 'send_reaction') {
-        const { roomId, playerId, emoji } = data;
-        const room = rooms.get(roomId);
-        if (room) {
-          broadcastToRoom(room, {
-            type: 'reaction',
-            playerId,
-            emoji,
-          });
-        }
-      }
+      data = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
+    try {
+      handleSocketMessage(ws, data);
     } catch (err) {
       console.error('[Arena WS Error]:', err);
     }
@@ -519,6 +693,7 @@ app.get('/api/open-rooms', (req, res) => {
         hostName: room.players[0]?.name || 'لاعب',
         playerCount: room.players.length,
         status: room.status,
+        gameType: room.gameType,
       });
     }
   });
@@ -528,102 +703,65 @@ app.get('/api/open-rooms', (req, res) => {
 let triviaVersion = Date.now();
 let playersVersion = Date.now();
 
-// 3. Room Status
+// 3. Room Status (clients poll this as a fallback when socket events are missed)
 app.get('/api/rooms/:roomId', (req, res) => {
   const room = rooms.get(req.params.roomId);
   if (!room) return res.status(404).json({ error: 'Room not found' });
-  const challengeObj = getFullPlayersList().find((p) => p.id === room.currentChallengeId) || getFullPlayersList()[0];
-  res.json({
-    id: room.id,
-    playerCount: room.players.length,
-    status: room.status,
-    currentRound: room.currentRound,
-    currentChallengeId: room.currentChallengeId,
-    challenge: challengeObj,
-    buzzedPlayerId: room.buzzedPlayerId,
-    players: room.players.map((p) => ({ id: p.id, name: p.name, score: p.score, isHost: p.isHost })),
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ id: room.id, playerCount: room.players.length, ...roomSnapshot(room) });
+});
+
+// HTTP versions of create / join / start so private rooms also work without a socket
+app.post('/api/rooms/create', (req, res) => {
+  const { playerId, playerName } = req.body || {};
+  if (!playerId) return res.status(400).json({ error: 'Missing playerId' });
+  const room = createRoom({
+    gameType: normalizeGameType(req.body.gameType),
+    status: 'waiting',
+    players: [{ id: playerId, name: playerName || 'المضيف', score: 0, ws: null, isHost: true }],
   });
+  res.json({ success: true, ...roomSnapshot(room) });
+});
+
+app.post('/api/rooms/join', (req, res) => {
+  const { playerId, playerName } = req.body || {};
+  const roomId = String(req.body?.roomId || '').trim().toUpperCase();
+  const room = rooms.get(roomId);
+  if (!playerId) return res.status(400).json({ error: 'Missing playerId' });
+  if (!room) return res.status(404).json({ error: 'رمز الغرفة غير موجود أو تم إغلاقها' });
+
+  const existing = room.players.find((p) => p.id === playerId);
+  if (!existing) {
+    if (room.status !== 'waiting' || room.players.length >= 2) {
+      return res.status(409).json({ error: 'الغرفة ممتلئة أو بدأت المباراة بالفعل' });
+    }
+    room.players.push({ id: playerId, name: playerName || 'لاعب منافس', score: 0, ws: null, isHost: false });
+    broadcastToRoom(room, { type: 'room_joined', ...roomSnapshot(room) });
+  }
+  res.json({ success: true, ...roomSnapshot(room) });
+});
+
+app.post('/api/rooms/start', (req, res) => {
+  const room = rooms.get(req.body?.roomId);
+  if (!room) return res.status(404).json({ error: 'Room not found' });
+  if (room.status === 'waiting' && room.players.length >= 2) startRoom(room);
+  res.json({ success: true, ...roomSnapshot(room) });
 });
 
 // HTTP Real-Time Matchmaking Fallback API
 app.post('/api/matchmaking/find', (req, res) => {
-  const { playerId, playerName } = req.body;
+  const { playerId, playerName } = req.body || {};
   if (!playerId) return res.status(400).json({ error: 'Missing playerId' });
 
-  // Clean inactive entries
-  matchmakingQueue = matchmakingQueue.filter((p) => p.ws ? p.ws.readyState === WebSocket.OPEN : true);
+  const gameType = normalizeGameType(req.body.gameType);
+  const result = matchOrQueue(playerId, playerName || 'لاعب', gameType, null);
 
-  // Check if an available opponent is waiting
-  const opponentIdx = matchmakingQueue.findIndex((p) => p.playerId !== playerId);
-  if (opponentIdx !== -1) {
-    const opponent = matchmakingQueue.splice(opponentIdx, 1)[0];
-    const roomId = 'B11-' + Math.floor(1000 + Math.random() * 9000);
-    const challengeIds = pickRandomChallengeIds(5);
-    const firstChallenge = getFullPlayersList().find((p) => p.id === challengeIds[0]) || getFullPlayersList()[0];
-
-    const newRoom: GameRoom = {
-      id: roomId,
-      players: [
-        { id: opponent.playerId, name: opponent.playerName, score: 0, ws: opponent.ws, isHost: true },
-        { id: playerId, name: playerName || 'لاعب 2', score: 0, ws: null as any, isHost: false },
-      ],
-      status: 'playing',
-      currentRound: 0,
-      totalRounds: 5,
-      buzzedPlayerId: null,
-      lastWinnerId: null,
-      challengeIds,
-      currentChallengeId: challengeIds[0] || 'salah',
-      buzzerTimer: null,
-    };
-    rooms.set(roomId, newRoom);
-
-    broadcastToRoom(newRoom, {
-      type: 'match_started',
-      roomId,
-      players: newRoom.players.map((p) => ({ id: p.id, name: p.name, score: p.score, isHost: p.isHost })),
-      currentRound: 0,
-      currentChallengeId: newRoom.currentChallengeId,
-      challenge: firstChallenge,
-      totalRounds: 5,
-      status: 'playing',
-    });
-
-    return res.json({
-      status: 'matched',
-      roomId,
-      players: newRoom.players.map((p) => ({ id: p.id, name: p.name, score: p.score, isHost: p.isHost })),
-      currentRound: 0,
-      currentChallengeId: newRoom.currentChallengeId,
-      challenge: firstChallenge,
-    });
+  if (result.room) {
+    if (result.created) announceMatch(result.room);
+    return res.json({ status: 'matched', ...roomSnapshot(result.room) });
   }
 
-  // Check if another player just matched us into a room
-  let activeRoom: GameRoom | undefined;
-  rooms.forEach((r) => {
-    if (r.players.some((p) => p.id === playerId)) {
-      activeRoom = r;
-    }
-  });
-
-  if (activeRoom) {
-    const challengeObj = getFullPlayersList().find((p) => p.id === activeRoom!.currentChallengeId) || getFullPlayersList()[0];
-    return res.json({
-      status: activeRoom.status === 'playing' ? 'matched' : 'waiting',
-      roomId: activeRoom.id,
-      players: activeRoom.players.map((p) => ({ id: p.id, name: p.name, score: p.score, isHost: p.isHost })),
-      currentRound: activeRoom.currentRound,
-      currentChallengeId: activeRoom.currentChallengeId,
-      challenge: challengeObj,
-    });
-  }
-
-  // Add to queue
-  matchmakingQueue = matchmakingQueue.filter((p) => p.playerId !== playerId);
-  matchmakingQueue.push({ ws: null as any, playerId, playerName: playerName || 'لاعب' });
   broadcastQueueStatus();
-
   res.json({
     status: 'queued',
     message: 'جاري البحث عن لاعب حقيقي أونلاين...',
@@ -633,114 +771,55 @@ app.post('/api/matchmaking/find', (req, res) => {
 });
 
 app.post('/api/matchmaking/buzz', (req, res) => {
-  const { roomId, playerId } = req.body;
+  const { roomId, playerId } = req.body || {};
   const room = rooms.get(roomId);
-  if (!room || room.status !== 'playing' || room.buzzedPlayerId !== null) {
-    return res.json({ success: false, buzzedPlayerId: room?.buzzedPlayerId });
-  }
+  if (!room) return res.json({ success: false });
 
-  room.buzzedPlayerId = playerId;
-  room.status = 'round_buzzed';
-  const buzzedPlayer = room.players.find((p) => p.id === playerId);
-
-  broadcastToRoom(room, {
-    type: 'player_buzzed',
-    buzzedPlayerId: playerId,
-    buzzedPlayerName: buzzedPlayer ? buzzedPlayer.name : 'لاعب',
-    timeLimit: 12,
+  const success = buzzIn(room, playerId);
+  res.json({
+    success,
+    status: room.status,
+    buzzedPlayerId: room.buzzedPlayerId,
+    buzzedPlayerName: room.buzzedPlayerName,
   });
-
-  res.json({ success: true, buzzedPlayerId: playerId });
 });
 
 app.post('/api/matchmaking/answer', (req, res) => {
-  const { roomId, playerId, isCorrect } = req.body;
+  const { roomId, playerId, isCorrect } = req.body || {};
   const room = rooms.get(roomId);
   if (!room) return res.status(404).json({ error: 'Room not found' });
 
-  if (room.buzzerTimer) clearTimeout(room.buzzerTimer);
-  room.status = 'round_finished';
-
-  if (isCorrect) {
-    const player = room.players.find((p) => p.id === playerId);
-    if (player) player.score += 100;
-    room.lastWinnerId = playerId;
-  } else {
-    const opponent = room.players.find((p) => p.id !== playerId);
-    if (opponent) opponent.score += 50;
-    room.lastWinnerId = opponent ? opponent.id : null;
-  }
-
-  broadcastToRoom(room, {
-    type: 'round_result',
-    isCorrect,
-    lastWinnerId: room.lastWinnerId,
-    players: room.players.map((p) => ({ id: p.id, name: p.name, score: p.score, isHost: p.isHost })),
-  });
-
+  const success = submitAnswer(room, playerId, !!isCorrect);
   res.json({
-    success: true,
+    success,
+    status: room.status,
     lastWinnerId: room.lastWinnerId,
-    players: room.players.map((p) => ({ id: p.id, name: p.name, score: p.score, isHost: p.isHost })),
+    lastResult: room.lastResult,
+    players: publicPlayers(room),
   });
 });
 
 app.post('/api/matchmaking/next', (req, res) => {
-  const { roomId } = req.body;
+  const { roomId } = req.body || {};
   const room = rooms.get(roomId);
   if (!room) return res.status(404).json({ error: 'Room not found' });
 
-  room.currentRound += 1;
-  room.buzzedPlayerId = null;
-
-  if (room.currentRound >= room.totalRounds) {
-    room.status = 'game_over';
-    broadcastToRoom(room, {
-      type: 'game_over',
-      players: room.players.map((p) => ({ id: p.id, name: p.name, score: p.score, isHost: p.isHost })),
-    });
-    return res.json({ status: 'game_over' });
-  }
-
-  room.status = 'playing';
-  room.currentChallengeId = room.challengeIds[room.currentRound] || 'salah';
-  const nextChallenge = getFullPlayersList().find((p) => p.id === room.currentChallengeId) || getFullPlayersList()[0];
-
-  broadcastToRoom(room, {
-    type: 'new_round',
-    currentRound: room.currentRound,
-    currentChallengeId: room.currentChallengeId,
-    challenge: nextChallenge,
-    players: room.players.map((p) => ({ id: p.id, name: p.name, score: p.score, isHost: p.isHost })),
-  });
-
+  const success = advanceRound(room);
   res.json({
-    status: 'playing',
+    success,
+    status: room.status,
     currentRound: room.currentRound,
-    challenge: nextChallenge,
+    challenge: room.status === 'playing' ? getChallenge(room) : null,
+    players: publicPlayers(room),
   });
 });
 
 app.post('/api/matchmaking/leave', (req, res) => {
-  const { playerId, roomId } = req.body;
+  const { playerId } = req.body || {};
   matchmakingQueue = matchmakingQueue.filter((p) => p.playerId !== playerId);
-  if (roomId) {
-    const room = rooms.get(roomId);
-    if (room) {
-      room.players = room.players.filter((p) => p.id !== playerId);
-      if (room.players.length === 0) {
-        rooms.delete(roomId);
-      } else {
-        broadcastToRoom(room, {
-          type: 'player_left',
-          message: 'غادر المنافس المباراة. تم احتساب الفوز لك! 🏆',
-          winnerId: room.players[0].id,
-          winnerName: room.players[0].name,
-          players: room.players.map((p) => ({ id: p.id, name: p.name, score: p.score, isHost: p.isHost })),
-        });
-      }
-    }
-  }
+  Array.from(rooms.values()).forEach((room) => {
+    if (room.players.some((p) => p.id === playerId)) removePlayerFromRoom(room, playerId);
+  });
   broadcastQueueStatus();
   res.json({ success: true });
 });
